@@ -5,7 +5,7 @@ src/build-mingw/
 
 # Playdate build outputs
 src/Source/
-src/VGMPlayer.pdx/
+src/*.pdx/
 
 # Cloned third-party repositories
 src/vgmstream/

@@ -1,5 +1,5 @@
 /**
- * playdate-vgm-player — POC VGM/VGMStream player for Playdate
+ * play.VGM — POC VGM/VGMStream player for Playdate
  *
  * Architecture overview:
  * ─────────────────────
@@ -46,6 +46,10 @@ extern void             vgm_pd_streamfile_set_api(PlaydateAPI* pd);
 extern libstreamfile_t* vgm_pd_open_streamfile(const char* path);
 
 /* ── Constants ──────────────────────────────────────────────────────── */
+
+#ifndef GAME_NAME
+#define GAME_NAME "play.VGM"
+#endif
 
 #define PLAYDATE_AUDIO_RATE    44100
 #define DECODE_BUF_SAMPLES     512      /* samples per decode call        */
@@ -584,8 +588,11 @@ static void browser_draw(void)
     /* Title bar */
     pd->graphics->fillRect(0, 0, 400, 20, kColorBlack);
     pd->graphics->setDrawMode(kDrawModeInverted);
-    pd->graphics->drawText("VGM Player - Select File", 24,
-                           kASCIIEncoding, 8, 2);
+    {
+        static const char title[] = GAME_NAME " - Select File";
+        pd->graphics->drawText(title, sizeof(title) - 1,
+                               kASCIIEncoding, 8, 2);
+    }
     pd->graphics->setDrawMode(kDrawModeCopy);
 
     if (p->browser_count == 0) {

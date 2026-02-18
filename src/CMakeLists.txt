@@ -24,8 +24,8 @@ set(CMAKE_CONFIGURATION_TYPES "Debug;Release")
 set(CMAKE_XCODE_GENERATE_SCHEME TRUE)
 
 # ── Game name (used by playdate_game.cmake) ─────────────────────────
-set(PLAYDATE_GAME_NAME VGMPlayer)
-set(PLAYDATE_GAME_DEVICE VGMPlayer_DEVICE)
+set(PLAYDATE_GAME_NAME play.VGM)
+set(PLAYDATE_GAME_DEVICE play.VGM_DEVICE)
 
 project(${PLAYDATE_GAME_NAME} C ASM)
 
@@ -92,6 +92,9 @@ if (TOOLCHAIN STREQUAL "armgcc")
         ${CMAKE_CURRENT_SOURCE_DIR}/vgmstream/src/base
         ${SID_INCDIRS}
     )
+    target_compile_definitions(${PLAYDATE_GAME_DEVICE} PRIVATE
+        GAME_NAME="${PLAYDATE_GAME_NAME}"
+    )
     if(TARGET libvgmstream)
         target_link_libraries(${PLAYDATE_GAME_DEVICE} PRIVATE libvgmstream)
     endif()
@@ -103,6 +106,9 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/vgmstream/src
         ${CMAKE_CURRENT_SOURCE_DIR}/vgmstream/src/base
         ${SID_INCDIRS}
+    )
+    target_compile_definitions(${PLAYDATE_GAME_NAME} PRIVATE
+        GAME_NAME="${PLAYDATE_GAME_NAME}"
     )
     set(_libs "")
     if(TARGET libvgmstream)

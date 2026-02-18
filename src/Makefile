@@ -1,15 +1,15 @@
 # ══════════════════════════════════════════════════════════════════════
-# playdate-vgm-player — Makefile for simulator (Windows) and device
+# play.VGM — Makefile for simulator (Windows) and device
 #
 # Run from this directory (src/) with PLAYDATE_SDK_PATH set:
 #   export PLAYDATE_SDK_PATH=/mnt/c/Users/YourName/Documents/PlaydateSDK
-#   make          # simulator build (produces VGMPlayer.pdx)
+#   make          # simulator build (produces play.VGM.pdx)
 #   make device   # ARM device build
 # ══════════════════════════════════════════════════════════════════════
 
 SDK       ?= $(PLAYDATE_SDK_PATH)
-PRODUCT   = VGMPlayer.pdx
-GAME_NAME = VGMPlayer
+GAME_NAME = play.VGM
+PRODUCT   = $(GAME_NAME).pdx
 
 # ── vgmstream paths ────────────────────────────────────────────────
 VGM_DIR = vgmstream
@@ -17,6 +17,7 @@ VGM_SRC = $(VGM_DIR)/src
 
 # ── Codec flags — disable all heavy codecs ─────────────────────────
 UDEFS = \
+	-DGAME_NAME=\"$(GAME_NAME)\" \
 	-DVGM_USE_FFMPEG=0 \
 	-DVGM_USE_MPEG=0 \
 	-DVGM_USE_VORBIS=0 \
