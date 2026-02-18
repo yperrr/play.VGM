@@ -1,0 +1,35 @@
+# Build directories
+build/
+src/build/
+src/build-mingw/
+
+# Playdate build outputs
+src/Source/
+src/VGMPlayer.pdx/
+
+# Cloned third-party repositories
+src/vgmstream/
+src/crsid/
+
+# IDE / editor config
+.idea/
+.vscode/
+.claude/
+
+# Compiled binaries and objects
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.exe
+*.dylib
+
+# Backup files
+*.bak
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
