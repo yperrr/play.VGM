@@ -31,6 +31,7 @@ UDEFS = \
 UINCLUDE = \
 	-I. \
 	-Icrsid \
+	-Ilibxmp/include \
 	-I$(VGM_SRC) \
 	-I$(VGM_SRC)/base \
 	-I$(VGM_SRC)/coding \
@@ -42,7 +43,8 @@ UINCLUDE = \
 GAME_FILES = \
 	main.c \
 	vgm_pd_streamfile.c \
-	sid_player_crsid.c
+	sid_player_crsid.c \
+	mod_player.c
 
 # ── vgmstream core sources (minimal ADPCM-only subset) ────────────
 VGM_FILES = \

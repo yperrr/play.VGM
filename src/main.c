@@ -1,5 +1,5 @@
 /**
- * play.VGM — POC VGM/VGMStream player for Playdate
+ * play.VGM — POC VGM player for Playdate
  *
  * Architecture overview:
  * ─────────────────────
@@ -40,6 +40,7 @@
  */
 #include "libvgmstream.h"
 #include "sid_player.h"
+#include "mod_player.h"
 
 /* Playdate filesystem adapter for vgmstream (see vgm_pd_streamfile.c) */
 extern void             vgm_pd_streamfile_set_api(PlaydateAPI* pd);
@@ -77,6 +78,9 @@ typedef struct {
 
     /* SID decoder context (NULL when playing a vgmstream file) */
     SidPlayer* sid;
+
+    /* Tracker module decoder context (NULL when not playing a tracker file) */
+    ModPlayer* mod;
 
     /* Track title from metadata (SID header) */
     char track_title[128];
@@ -181,7 +185,7 @@ static int audio_callback(void* context, int16_t* left, int16_t* right, int len)
             len, right ? "yes" : "no", p->channels);
     }
 
-    if (p->state != STATE_PLAYING || (!p->vgm && !p->sid)) {
+    if (p->state != STATE_PLAYING || (!p->vgm && !p->sid && !p->mod)) {
         /* silence */
         memset(left, 0, len * sizeof(int16_t));
         if (right) memset(right, 0, len * sizeof(int16_t));
@@ -300,6 +304,9 @@ static void decode_fill_buffer(void)
     if (p->sid) {
         /* SID path: always produces the requested number of samples */
         decoded = sid_player_fill(p->sid, p->decode_buf, DECODE_BUF_SAMPLES);
+    } else if (p->mod) {
+        /* Tracker path: returns 0 at end of module */
+        decoded = mod_player_fill(p->mod, p->decode_buf, DECODE_BUF_SAMPLES);
     } else if (p->vgm) {
         /*
          * libvgmstream_fill() decodes audio into the provided buffer.
@@ -372,6 +379,37 @@ static int player_open_file(const char* path)
         p->pd->system->logToConsole(
             "SID: opened %s - %dch %dHz (looping)",
             path, p->channels, p->sample_rate
+        );
+        return 1;
+    }
+
+    /* ── Route tracker modules to libxmp ── */
+    if (ext && (strcasecmp(ext, ".mod") == 0 ||
+                strcasecmp(ext, ".xm")  == 0 ||
+                strcasecmp(ext, ".it")  == 0 ||
+                strcasecmp(ext, ".s3m") == 0)) {
+        p->mod = mod_player_open(p->pd, path);
+        if (!p->mod) {
+            snprintf(p->error_msg, sizeof(p->error_msg),
+                     "Tracker load failed: %s", path);
+            p->state = STATE_ERROR;
+            return 0;
+        }
+        p->channels      = mod_player_channels(p->mod);
+        p->sample_rate   = mod_player_sample_rate(p->mod);
+        p->total_samples = mod_player_total_samples(p->mod);
+        p->current_sample = 0;
+        p->loop_count    = 0;
+        p->resample_step = 0;  /* libxmp outputs at 44100 Hz, no resampling */
+        p->resample_frac = 0;
+
+        const char* title = mod_player_title(p->mod);
+        if (title[0] != '\0')
+            strncpy(p->track_title, title, sizeof(p->track_title) - 1);
+
+        p->pd->system->logToConsole(
+            "MOD: opened %s - %dch %dHz %d samples",
+            path, p->channels, p->sample_rate, (int)p->total_samples
         );
         return 1;
     }
@@ -455,6 +493,10 @@ static void player_close(void)
         sid_player_close(p->sid);
         p->sid = NULL;
     }
+    if (p->mod) {
+        mod_player_close(p->mod);
+        p->mod = NULL;
+    }
     p->ring_count = 0;
     p->ring_read  = 0;
     p->ring_write = 0;
@@ -464,7 +506,7 @@ static void player_close(void)
 static void player_play(void)
 {
     VGMPlayer* p = &g_player;
-    if (!p->vgm && !p->sid) return;
+    if (!p->vgm && !p->sid && !p->mod) return;
 
     if (!p->audio_source) {
         /* Register audio callback — stereo if file is stereo */
@@ -502,12 +544,19 @@ static void player_stop(void)
 static void player_seek(int32_t sample)
 {
     VGMPlayer* p = &g_player;
-    if (!p->vgm) return;
 
     if (sample < 0) sample = 0;
-    if (sample > p->total_samples) sample = p->total_samples;
+    if (p->total_samples > 0 && sample > p->total_samples)
+        sample = p->total_samples;
 
-    libvgmstream_seek(p->vgm, sample);
+    if (p->vgm) {
+        libvgmstream_seek(p->vgm, sample);
+    } else if (p->mod) {
+        mod_player_seek(p->mod, sample);
+    } else {
+        return;
+    }
+
     p->current_sample = sample;
     p->ring_count = 0;  /* flush buffer */
     p->needs_redraw = 1;
@@ -544,6 +593,7 @@ static void browser_listfiles_callback(const char* filename, void* userdata)
         ".wem",  ".xwb",  ".fsb",   ".bnk",   ".acb",
         ".awb",  ".txtp", ".str",   ".ss2",   ".ads",
         ".mib",  ".sid",
+        ".mod",  ".xm",   ".it",   ".s3m",
         NULL
     };
 
@@ -1065,7 +1115,7 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 
     case kEventResume:
         /* Resume playback that was paused when the system menu opened */
-        if (g_player.vgm || g_player.sid)
+        if (g_player.vgm || g_player.sid || g_player.mod)
             player_play();
         break;
 

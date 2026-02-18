@@ -74,11 +74,42 @@ else()
 endif()
 set(SID_LIBS "")
 
+# ── Tracker module playback: libxmp-lite (MOD/S3M/XM/IT) ─────────────
+#
+# libxmp-lite is a lightweight C library for decoding tracker modules.
+# We build the "lite" variant which supports MOD, S3M, XM, IT only
+# (no exotic formats), keeping the binary small for Playdate.
+#
+# To enable tracker playback, clone libxmp into src/libxmp/:
+#   git clone https://github.com/libxmp/libxmp.git src/libxmp
+#
+set(BUILD_LITE    ON  CACHE BOOL "" FORCE)
+set(BUILD_STATIC  ON  CACHE BOOL "" FORCE)
+set(BUILD_SHARED  OFF CACHE BOOL "" FORCE)
+set(LIBXMP_DISABLE_DEPACKERS ON CACHE BOOL "" FORCE)
+set(LIBXMP_DISABLE_PROWIZARD ON CACHE BOOL "" FORCE)
+
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/libxmp/CMakeLists.txt)
+    add_subdirectory(libxmp)
+    set(MOD_SOURCES mod_player.c)
+    set(MOD_INCDIRS ${CMAKE_CURRENT_SOURCE_DIR}/libxmp/include)
+    set(MOD_LIBS xmp_lite_static)
+else()
+    message(WARNING
+        "libxmp not found — tracker playback disabled.\n"
+        "To enable it, run:\n"
+        "  git clone https://github.com/libxmp/libxmp.git src/libxmp")
+    set(MOD_SOURCES "")
+    set(MOD_INCDIRS "")
+    set(MOD_LIBS "")
+endif()
+
 # ── Game sources ─────────────────────────────────────────────────────
 set(GAME_SRC
     main.c
     vgm_pd_streamfile.c
     ${SID_SOURCES}
+    ${MOD_SOURCES}
 )
 
 # ── Create targets BEFORE including playdate_game.cmake ─────────────
@@ -91,12 +122,20 @@ if (TOOLCHAIN STREQUAL "armgcc")
         ${CMAKE_CURRENT_SOURCE_DIR}/vgmstream/src
         ${CMAKE_CURRENT_SOURCE_DIR}/vgmstream/src/base
         ${SID_INCDIRS}
+        ${MOD_INCDIRS}
     )
     target_compile_definitions(${PLAYDATE_GAME_DEVICE} PRIVATE
         GAME_NAME="${PLAYDATE_GAME_NAME}"
     )
+    set(_dev_libs "")
     if(TARGET libvgmstream)
-        target_link_libraries(${PLAYDATE_GAME_DEVICE} PRIVATE libvgmstream)
+        list(APPEND _dev_libs libvgmstream)
+    endif()
+    if(MOD_LIBS)
+        list(APPEND _dev_libs ${MOD_LIBS})
+    endif()
+    if(_dev_libs)
+        target_link_libraries(${PLAYDATE_GAME_DEVICE} PRIVATE ${_dev_libs})
     endif()
 else()
     add_library(${PLAYDATE_GAME_NAME} SHARED
@@ -106,6 +145,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/vgmstream/src
         ${CMAKE_CURRENT_SOURCE_DIR}/vgmstream/src/base
         ${SID_INCDIRS}
+        ${MOD_INCDIRS}
     )
     target_compile_definitions(${PLAYDATE_GAME_NAME} PRIVATE
         GAME_NAME="${PLAYDATE_GAME_NAME}"
@@ -116,6 +156,9 @@ else()
     endif()
     if(SID_LIBS)
         list(APPEND _libs ${SID_LIBS})
+    endif()
+    if(MOD_LIBS)
+        list(APPEND _libs ${MOD_LIBS})
     endif()
     if(_libs)
         target_link_libraries(${PLAYDATE_GAME_NAME} PRIVATE ${_libs})
