@@ -53,7 +53,8 @@ extern libstreamfile_t* vgm_pd_open_streamfile(const char* path);
 #endif
 
 #define PLAYDATE_AUDIO_RATE    44100
-#define DECODE_BUF_SAMPLES     512      /* samples per decode call        */
+#define RING_BUF_SAMPLES       16384    /* ring buffer capacity (samples) */
+#define DECODE_CHUNK           512      /* samples per decode call        */
 #define VIS_SAMPLES            360      /* one sample per oscilloscope pixel */
 #define MAX_PATH               256
 #define BROWSER_MAX_FILES      64
@@ -88,17 +89,20 @@ typedef struct {
     /* Audio output */
     SoundSource* audio_source;
 
-    /* Decoded PCM ring buffer
-     * vgmstream outputs interleaved int16 PCM;
-     * Playdate's callback wants int16 per-channel buffers.
-     * We keep a small circular buffer to bridge the two. */
-    int16_t  decode_buf[DECODE_BUF_SAMPLES * 2];  /* stereo worst case  */
-    int      ring_read;
-    int      ring_write;
-    int      ring_count;  /* samples available (per channel) */
+    /* Lock-free SPSC ring buffer: producer (update/decode) writes ring_write,
+     * consumer (audio callback) writes ring_read.  Each index is only ever
+     * modified by one thread, eliminating the race condition that caused
+     * stuttering with the old shared ring_count approach.
+     * One slot is always kept empty to distinguish full from empty. */
+    int16_t  ring_buf[RING_BUF_SAMPLES * 2];   /* stereo worst case    */
+    int16_t  decode_tmp[DECODE_CHUNK * 2];      /* temp decode output   */
+    volatile int ring_read;    /* consumer (audio callback) owns this   */
+    volatile int ring_write;   /* producer (decode_fill_ring) owns this */
+    int      stream_ended;     /* 1 when decoder has no more data       */
 
     /* Playback info */
-    int      channels;
+    int      channels;         /* output channels (1 if force_mono) */
+    int      source_channels;  /* file's native channel count       */
     int      sample_rate;
     int32_t  total_samples;
     int32_t  current_sample;
@@ -130,6 +134,10 @@ typedef struct {
     /* System menu items */
     PDMenuItem* menu_vis_toggle;
     PDMenuItem* menu_vis_fs;
+    PDMenuItem* menu_mono;
+
+    /* Audio mode */
+    int      force_mono;     /* 1 = mono output (default, better perf), 0 = stereo */
 
     /* Dirty flag for display refresh */
     int      needs_redraw;
@@ -147,8 +155,13 @@ static void player_pause(void);
 static void player_stop(void);
 static void player_seek(int32_t sample);
 
+static inline int ring_avail(VGMPlayer* p) {
+    return (p->ring_write - p->ring_read + RING_BUF_SAMPLES) % RING_BUF_SAMPLES;
+}
+
 static int  audio_callback(void* context, int16_t* left, int16_t* right, int len);
-static void decode_fill_buffer(void);
+static void decode_fill_ring(void);
+static void player_prefill_audio(float budget);
 
 static void browser_scan(const char* directory);
 static void browser_draw(void);
@@ -157,171 +170,193 @@ static void vis_fullscreen_draw(void);
 static void error_draw(void);
 
 /* ══════════════════════════════════════════════════════════════════════
- * AUDIO CALLBACK — Heart of the player
+ * AUDIO CALLBACK — reads from pre-filled ring buffer only
  * ══════════════════════════════════════════════════════════════════════
  *
  * Called by Playdate's audio engine every render cycle.
  * Must fill `left` (and `right` if stereo) with `len` samples.
  *
- * Strategy:
- *   1. If ring buffer has enough samples → copy them out
- *   2. Otherwise, call vgmstream to decode more, then copy
- *   3. Apply volume scaling from crank position
- *   4. Return 1 if we produced audio, 0 if silent
+ * IMPORTANT: This callback must be fast.  All decoding happens in
+ * update() via player_prefill_audio().  The callback only copies
+ * from the ring buffer; if the buffer is empty, it outputs silence.
  */
 static int audio_callback(void* context, int16_t* left, int16_t* right, int len)
 {
     VGMPlayer* p = (VGMPlayer*)context;
 
-    /* One-shot diagnostic: log what the SDK actually passes us */
-    static int logged = 0;
-    if (!logged) {
-        logged = 1;
-        p->pd->system->logToConsole(
-            "audio_callback: len=%d stereo=%s ch=%d",
-            len, right ? "yes" : "no", p->channels);
-    }
-
     if (p->state != STATE_PLAYING || (!p->vgm && !p->sid && !p->mod)) {
-        /* silence */
         memset(left, 0, len * sizeof(int16_t));
         if (right) memset(right, 0, len * sizeof(int16_t));
         return p->state == STATE_PLAYING ? 1 : 0;
     }
 
     int written = 0;
+    int avail = ring_avail(p);
 
-    while (written < len) {
-        /* Refill decode buffer if empty (or too few samples for interpolation) */
-        int min_samples = (p->resample_step ? 2 : 1);
-        if (p->ring_count < min_samples) {
-            decode_fill_buffer();
-            if (p->ring_count < min_samples) {
-                if (p->sid) {
-                    /* SID loops forever — decode_fill_buffer should never
-                     * return 0 for SID, but if it does just output silence
-                     * and continue (don't stop playback). */
-                    memset(left + written, 0, (len - written) * sizeof(int16_t));
-                    if (right) memset(right + written, 0, (len - written) * sizeof(int16_t));
-                    return 1;
-                }
-                /* vgmstream end of stream (including files where total_samples
-                 * is 0 = unknown length and the decoder ran out of data). */
-                memset(left + written, 0, (len - written) * sizeof(int16_t));
-                if (right) memset(right + written, 0, (len - written) * sizeof(int16_t));
-                p->state = STATE_BROWSER;
-                p->needs_redraw = 1;
-                return 1;
-            }
-        }
-
-        /* Copy from ring buffer to output, with optional resampling.
-         * Volume is handled by the SDK's SoundSource setVolume(). */
-        int src_consumed = 0;
-
-        if (p->resample_step == 0) {
-            /* No resampling needed (source == 44100 Hz) */
-            int to_copy = len - written;
-            if (to_copy > p->ring_count) to_copy = p->ring_count;
-
-            if (p->channels == 1) {
-                for (int i = 0; i < to_copy; i++) {
-                    int idx = (p->ring_read + i) % DECODE_BUF_SAMPLES;
-                    int16_t s = p->decode_buf[idx];
-                    left[written + i] = s;
-                    if (right) right[written + i] = s;
-                }
-            } else {
-                for (int i = 0; i < to_copy; i++) {
-                    int idx = (p->ring_read + i) % DECODE_BUF_SAMPLES;
-                    left[written + i]  = p->decode_buf[idx * 2];
-                    if (right) right[written + i] = p->decode_buf[idx * 2 + 1];
-                }
-            }
-            src_consumed = to_copy;
-            written += to_copy;
-        } else {
-            /* Resample: step through source at fractional rate */
-            uint32_t frac = p->resample_frac;
-            uint32_t step = p->resample_step;
-            int remaining = len - written;
-
-            for (int i = 0; i < remaining; i++) {
-                int src_i = (int)(frac >> 16);
-                if (src_i >= p->ring_count) break;  /* need more source data */
-
-                int f = (int)(frac & 0xFFFF);  /* interpolation fraction 0..65535 */
-                int idx0 = (p->ring_read + src_i) % DECODE_BUF_SAMPLES;
-                int next  = (src_i + 1 < p->ring_count) ? src_i + 1 : src_i;
-                int idx1  = (p->ring_read + next) % DECODE_BUF_SAMPLES;
-
-                if (p->channels == 1) {
-                    int s = p->decode_buf[idx0] + ((p->decode_buf[idx1] - p->decode_buf[idx0]) * f >> 16);
-                    left[written] = (int16_t)s;
-                    if (right) right[written] = (int16_t)s;
-                } else {
-                    int l = p->decode_buf[idx0 * 2]     + ((p->decode_buf[idx1 * 2]     - p->decode_buf[idx0 * 2])     * f >> 16);
-                    int r = p->decode_buf[idx0 * 2 + 1] + ((p->decode_buf[idx1 * 2 + 1] - p->decode_buf[idx0 * 2 + 1]) * f >> 16);
-                    left[written]  = (int16_t)l;
-                    if (right) right[written] = (int16_t)r;
-                }
-
-                written++;
-                frac += step;
-            }
-
-            src_consumed = (int)(frac >> 16);
-            p->resample_frac = frac - ((uint32_t)src_consumed << 16);
-        }
-
-        p->ring_read = (p->ring_read + src_consumed) % DECODE_BUF_SAMPLES;
-        p->ring_count -= src_consumed;
-        p->current_sample += src_consumed;
+    if (avail <= 0) {
+        /* Buffer underrun — output silence, will be refilled in update() */
+        memset(left, 0, len * sizeof(int16_t));
+        if (right) memset(right, 0, len * sizeof(int16_t));
+        return 1;
     }
 
-    /* Snapshot output for oscilloscope visualization */
-    int vis_n = (written < VIS_SAMPLES) ? written : VIS_SAMPLES;
-    memcpy(p->vis_buf, left, vis_n * sizeof(int16_t));
-    p->vis_count = vis_n;
+    if (p->resample_step == 0) {
+        /* No resampling (source == 44100 Hz) */
+        int to_copy = len;
+        if (to_copy > avail) to_copy = avail;
 
-    p->needs_redraw = 1;
+        if (p->channels == 1) {
+            for (int i = 0; i < to_copy; i++) {
+                int idx = (p->ring_read + i) % RING_BUF_SAMPLES;
+                int16_t s = p->ring_buf[idx];
+                left[i] = s;
+                if (right) right[i] = s;
+            }
+        } else {
+            for (int i = 0; i < to_copy; i++) {
+                int idx = (p->ring_read + i) % RING_BUF_SAMPLES;
+                left[i]  = p->ring_buf[idx * 2];
+                if (right) right[i] = p->ring_buf[idx * 2 + 1];
+            }
+        }
+
+        /* Zero-fill remainder if buffer didn't have enough */
+        if (to_copy < len) {
+            memset(left + to_copy, 0, (len - to_copy) * sizeof(int16_t));
+            if (right) memset(right + to_copy, 0, (len - to_copy) * sizeof(int16_t));
+        }
+
+        p->ring_read = (p->ring_read + to_copy) % RING_BUF_SAMPLES;
+        p->current_sample += to_copy;
+        written = len;
+    } else {
+        /* Resample: step through source at fractional rate */
+        uint32_t frac = p->resample_frac;
+        uint32_t step = p->resample_step;
+        int src_consumed = 0;
+
+        for (int i = 0; i < len; i++) {
+            int src_i = (int)(frac >> 16);
+            if (src_i >= avail - 1) break;  /* need more source data */
+
+            int f = (int)(frac & 0xFFFF);
+            int idx0 = (p->ring_read + src_i) % RING_BUF_SAMPLES;
+            int idx1 = (p->ring_read + src_i + 1) % RING_BUF_SAMPLES;
+
+            if (p->channels == 1) {
+                int s = p->ring_buf[idx0] + ((p->ring_buf[idx1] - p->ring_buf[idx0]) * f >> 16);
+                left[written] = (int16_t)s;
+                if (right) right[written] = (int16_t)s;
+            } else {
+                int l = p->ring_buf[idx0 * 2]     + ((p->ring_buf[idx1 * 2]     - p->ring_buf[idx0 * 2])     * f >> 16);
+                int r = p->ring_buf[idx0 * 2 + 1] + ((p->ring_buf[idx1 * 2 + 1] - p->ring_buf[idx0 * 2 + 1]) * f >> 16);
+                left[written]  = (int16_t)l;
+                if (right) right[written] = (int16_t)r;
+            }
+
+            written++;
+            frac += step;
+        }
+
+        src_consumed = (int)(frac >> 16);
+        p->resample_frac = frac - ((uint32_t)src_consumed << 16);
+        p->ring_read = (p->ring_read + src_consumed) % RING_BUF_SAMPLES;
+        p->current_sample += src_consumed;
+
+        /* Zero-fill if we couldn't produce enough output */
+        if (written < len) {
+            memset(left + written, 0, (len - written) * sizeof(int16_t));
+            if (right) memset(right + written, 0, (len - written) * sizeof(int16_t));
+        }
+    }
+
+    /* Snapshot for oscilloscope visualization (throttled) */
+    static int vis_skip = 0;
+    if (++vis_skip >= 4) {
+        vis_skip = 0;
+        int vis_n = (written < VIS_SAMPLES) ? written : VIS_SAMPLES;
+        memcpy(p->vis_buf, left, vis_n * sizeof(int16_t));
+        p->vis_count = vis_n;
+        p->needs_redraw = 1;
+    }
     return 1;
 }
 
-/* ── Decode chunk from vgmstream into ring buffer ───────────────────── */
+/* ── Decode one chunk and append to ring buffer ─────────────────────── */
 
-static void decode_fill_buffer(void)
+
+static void decode_fill_ring(void)
 {
     VGMPlayer* p = &g_player;
+    /* Reserve one slot to distinguish full from empty */
+    int space = RING_BUF_SAMPLES - 1 - ring_avail(p);
+    if (space < DECODE_CHUNK) return;  /* ring buffer full enough */
+
     int decoded = 0;
 
     if (p->sid) {
-        /* SID path: always produces the requested number of samples */
-        decoded = sid_player_fill(p->sid, p->decode_buf, DECODE_BUF_SAMPLES);
+        decoded = sid_player_fill(p->sid, p->decode_tmp, DECODE_CHUNK);
     } else if (p->mod) {
-        /* Tracker path: returns 0 at end of module */
-        decoded = mod_player_fill(p->mod, p->decode_buf, DECODE_BUF_SAMPLES);
+        decoded = mod_player_fill(p->mod, p->decode_tmp, DECODE_CHUNK);
     } else if (p->vgm) {
-        /*
-         * libvgmstream_fill() decodes audio into the provided buffer.
-         * It returns the number of samples actually decoded.
-         *
-         * The buffer receives interleaved int16 PCM:
-         *   mono:   [s0, s1, s2, ...]
-         *   stereo: [L0, R0, L1, R1, ...]
-         */
-        int err = libvgmstream_fill(p->vgm, p->decode_buf, DECODE_BUF_SAMPLES);
+        int err = libvgmstream_fill(p->vgm, p->decode_tmp, DECODE_CHUNK);
         if (err >= 0)
             decoded = p->vgm->decoder->buf_samples;
     }
 
-    if (decoded > 0) {
-        p->ring_read  = 0;
-        p->ring_write = decoded;
-        p->ring_count = decoded;
-    } else {
-        /* End of stream or error */
-        p->ring_count = 0;
+    if (decoded <= 0) {
+        p->stream_ended = 1;
+        return;
+    }
+
+    /* Downmix stereo → mono in-place when force_mono is active */
+    if (p->source_channels > 1 && p->channels == 1) {
+        for (int i = 0; i < decoded; i++)
+            p->decode_tmp[i] = (p->decode_tmp[i * 2] + p->decode_tmp[i * 2 + 1]) / 2;
+    }
+
+    /* Append decoded samples to ring buffer, handling wrap-around */
+    int write_pos = p->ring_write;
+    int ch = (p->channels <= 1) ? 1 : 2;
+    int first = RING_BUF_SAMPLES - write_pos;
+    if (first > decoded) first = decoded;
+    int second = decoded - first;
+
+    memcpy(&p->ring_buf[write_pos * ch], p->decode_tmp, first * ch * sizeof(int16_t));
+    if (second > 0)
+        memcpy(&p->ring_buf[0], &p->decode_tmp[first * ch], second * ch * sizeof(int16_t));
+
+    p->ring_write = (write_pos + decoded) % RING_BUF_SAMPLES;
+}
+
+/* ── Pre-fill ring buffer from update() — keeps audio fed ───────────── */
+
+/* Decode time budgets (seconds).  At 50 fps each frame is 20 ms.
+ * On non-draw frames the full frame is available for decoding.
+ * On draw frames we must leave headroom for the display update. */
+#define DECODE_BUDGET_NODRAW_S  0.018f  /* 18 ms — non-draw frames */
+#define DECODE_BUDGET_DRAW_S    0.010f  /* 10 ms — draw frames     */
+
+static void player_prefill_audio(float budget)
+{
+    VGMPlayer* p = &g_player;
+    if (p->state != STATE_PLAYING) return;
+    if (!p->vgm && !p->sid && !p->mod) return;
+
+    /* Decode until the ring buffer is ≥75 % full, the stream ends,
+     * or we exhaust the time budget — whichever comes first. */
+    int target = RING_BUF_SAMPLES * 3 / 4;
+    p->pd->system->resetElapsedTime();
+    while (ring_avail(p) < target && !p->stream_ended) {
+        decode_fill_ring();
+        if (p->pd->system->getElapsedTime() >= budget)
+            break;
+    }
+
+    /* If stream ended and ring buffer is empty, return to browser */
+    if (p->stream_ended && ring_avail(p) <= 0 && !p->sid) {
+        p->state = STATE_BROWSER;
+        p->needs_redraw = 1;
     }
 }
 
@@ -351,12 +386,18 @@ static int player_open_file(const char* path)
             p->state = STATE_ERROR;
             return 0;
         }
-        p->channels      = sid_player_channels(p->sid);
+        p->source_channels = sid_player_channels(p->sid);
+        p->channels      = p->source_channels;
         p->sample_rate   = sid_player_sample_rate(p->sid);
         p->total_samples = sid_player_total_samples(p->sid);  /* 0 = infinite */
         p->current_sample = 0;
         p->loop_count    = 0;
-        p->resample_step = 0;  /* SID outputs at 44100 Hz, no resampling */
+        /* Use the fast non-resampling path when source rate matches output */
+        if (p->sample_rate != PLAYDATE_AUDIO_RATE) {
+            p->resample_step = ((uint32_t)p->sample_rate << 16) / PLAYDATE_AUDIO_RATE;
+        } else {
+            p->resample_step = 0;
+        }
         p->resample_frac = 0;
 
         /* Populate track title for the player screen */
@@ -382,14 +423,15 @@ static int player_open_file(const char* path)
                 strcasecmp(ext, ".xm")  == 0 ||
                 strcasecmp(ext, ".it")  == 0 ||
                 strcasecmp(ext, ".s3m") == 0)) {
-        p->mod = mod_player_open(p->pd, path);
+        p->mod = mod_player_open(p->pd, path, p->force_mono);
         if (!p->mod) {
             snprintf(p->error_msg, sizeof(p->error_msg),
                      "Tracker load failed: %s", path);
             p->state = STATE_ERROR;
             return 0;
         }
-        p->channels      = mod_player_channels(p->mod);
+        p->source_channels = mod_player_channels(p->mod);
+        p->channels      = p->source_channels;
         p->sample_rate   = mod_player_sample_rate(p->mod);
         p->total_samples = mod_player_total_samples(p->mod);
         p->current_sample = 0;
@@ -449,7 +491,8 @@ static int player_open_file(const char* path)
 
     /* Read format info */
     const libvgmstream_format_t* fmt = p->vgm->format;
-    p->channels      = fmt->channels;
+    p->source_channels = fmt->channels;
+    p->channels      = (p->force_mono && fmt->channels > 1) ? 1 : fmt->channels;
     p->sample_rate   = fmt->sample_rate;
     p->total_samples = fmt->stream_samples;
     p->current_sample = 0;
@@ -465,8 +508,8 @@ static int player_open_file(const char* path)
     }
 
     p->pd->system->logToConsole(
-        "VGM: opened %s - %dch %dHz %d samples",
-        path, p->channels, p->sample_rate, (int)p->total_samples
+        "VGM: opened %s - %dch->%dch %dHz %d samples",
+        path, p->source_channels, p->channels, p->sample_rate, (int)p->total_samples
     );
 
     return 1;
@@ -491,9 +534,9 @@ static void player_close(void)
         mod_player_close(p->mod);
         p->mod = NULL;
     }
-    p->ring_count = 0;
-    p->ring_read  = 0;
-    p->ring_write = 0;
+    p->ring_read     = 0;
+    p->ring_write    = 0;
+    p->stream_ended  = 0;
     p->current_sample = 0;
 }
 
@@ -513,6 +556,12 @@ static void player_play(void)
     }
 
     p->state = STATE_PLAYING;
+    p->stream_ended = 0;
+    /* Higher refresh rate = more update() calls = more decode opportunities.
+     * 50 fps gives ~20 ms per frame instead of ~33 ms at 30 fps. */
+    p->pd->display->setRefreshRate(50);
+    /* Ring buffer will be filled gradually by update() — no blocking
+     * prefill here to avoid stalling on slow decoders (cRSID). */
     p->needs_redraw = 1;
 }
 
@@ -531,6 +580,7 @@ static void player_stop(void)
         p->audio_source = NULL;
     }
     player_close();
+    p->pd->display->setRefreshRate(30);  /* restore normal rate for browser */
     p->state = STATE_BROWSER;
     p->needs_redraw = 1;
 }
@@ -552,8 +602,10 @@ static void player_seek(int32_t sample)
     }
 
     p->current_sample = sample;
-    p->ring_count = 0;  /* flush buffer */
-    p->needs_redraw = 1;
+    p->ring_read     = 0;  /* flush buffer */
+    p->ring_write    = 0;
+    p->stream_ended  = 0;
+    p->needs_redraw  = 1;
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -1013,12 +1065,38 @@ static void menu_vis_fullscreen(void* userdata) {
     p->needs_redraw = 1;
 }
 
+static void menu_mono_toggle(void* userdata) {
+    VGMPlayer* p = (VGMPlayer*)userdata;
+    p->force_mono = p->pd->system->getMenuItemValue(p->menu_mono);
+
+    /* Reopen the current file to apply the new channel mode */
+    if ((p->mod || p->vgm) && p->current_file[0] != '\0') {
+        int was_playing = (p->state == STATE_PLAYING);
+        int32_t pos = p->current_sample;
+
+        /* Remove old audio source */
+        if (p->audio_source) {
+            p->pd->sound->removeSource(p->audio_source);
+            p->audio_source = NULL;
+        }
+
+        if (player_open_file(p->current_file)) {
+            if (was_playing) {
+                player_play();
+                if (pos > 0) player_seek(pos);
+            }
+        }
+    }
+    p->needs_redraw = 1;
+}
+
 static void player_init(PlaydateAPI* pd)
 {
     memset(&g_player, 0, sizeof(VGMPlayer));
     g_player.pd     = pd;
     g_player.state  = STATE_BROWSER;
     g_player.vis_enabled = 1;
+    g_player.force_mono = 1;  /* default: mono for better device performance */
     g_player.needs_redraw = 1;
 
     /* Initialise Playdate filesystem adapter for vgmstream */
@@ -1029,6 +1107,8 @@ static void player_init(PlaydateAPI* pd)
         "Visualizer", 1, menu_vis_toggle, &g_player);
     g_player.menu_vis_fs = pd->system->addCheckmarkMenuItem(
         "Fullscreen Viz", 0, menu_vis_fullscreen, &g_player);
+    g_player.menu_mono = pd->system->addCheckmarkMenuItem(
+        "Mono output", 1, menu_mono_toggle, &g_player);
 
     /* Scan for audio files */
     browser_scan("vgm");
@@ -1040,8 +1120,16 @@ static int update(void* userdata)
 
     handle_input();
 
+    int will_draw = p->needs_redraw;
+
+    /* Pre-fill audio ring buffer from the main thread so the audio
+     * callback never has to decode (which would cause lag/stuttering).
+     * Use a larger budget on non-draw frames where we have more time. */
+    float budget = will_draw ? DECODE_BUDGET_DRAW_S : DECODE_BUDGET_NODRAW_S;
+    player_prefill_audio(budget);
+
     /* Only redraw when needed (saves CPU) */
-    if (p->needs_redraw) {
+    if (will_draw) {
         int is_playing = (p->state == STATE_PLAYING || p->state == STATE_PAUSED);
         if (is_playing && p->vis_enabled && p->vis_fullscreen) {
             vis_fullscreen_draw();

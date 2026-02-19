@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.14)
 set(CMAKE_C_STANDARD 11)
 
+# Default to Release if no build type specified (single-config generators).
+# Without this, the SDK's CONFIG-based -O2 flags don't activate.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(ENVSDK $ENV{PLAYDATE_SDK_PATH})
 
 if (NOT ${ENVSDK} STREQUAL "")
@@ -32,6 +38,14 @@ project(${PLAYDATE_GAME_NAME} C ASM)
 # ── Directory shortcuts ───────────────────────────────────────────────
 set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
 set(LIBS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/libs)
+
+# ── Propagate Cortex-M7 flags to ALL targets (including libraries) ────
+# The SDK's playdate.cmake only sets these on the game target.
+# Without this, libraries like libxmp and vgmstream compile in ARM mode,
+# which the Cortex-M7 cannot execute (UNDEFINSTR hard fault).
+if(TOOLCHAIN STREQUAL "armgcc")
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mthumb -mcpu=cortex-m7 -mfloat-abi=hard -mfpu=fpv5-sp-d16 -D__FPU_USED=1")
+endif()
 
 # ── vgmstream config ───────────────────────────────────────────────
 set(USE_FFMPEG        OFF CACHE BOOL "" FORCE)
@@ -182,6 +196,20 @@ endif()
 
 # ── Let SDK set compile flags, packaging, etc. ──────────────────────
 include(${SDK}/C_API/buildsupport/playdate_game.cmake)
+
+# ── Override SDK's -O2 with -O3 for the game target on device ────────
+# The SDK hardcodes -O2 via target_compile_options.  Adding -O3 after
+# makes GCC use it instead (last -O flag wins).  Critical for cRSID
+# and vgmstream which need every cycle on the Cortex-M7.
+if(TOOLCHAIN STREQUAL "armgcc")
+    target_compile_options(${PLAYDATE_GAME_DEVICE} PRIVATE -O3)
+    if(TARGET libvgmstream)
+        target_compile_options(libvgmstream PRIVATE -O3)
+    endif()
+    if(TARGET xmp_lite_static)
+        target_compile_options(xmp_lite_static PRIVATE -O3)
+    endif()
+endif()
 
 # ── Clean stale PDX before build, then recreate vgm/ folder ──────────
 if(TOOLCHAIN STREQUAL "armgcc")

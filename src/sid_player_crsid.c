@@ -61,7 +61,7 @@ SidPlayer* sid_player_open(PlaydateAPI* pd, const char* path)
      * returns a pointer to the global cRSID_C64 instance (no SDL).
      * buflen=0 is fine for embedded use; the argument only suppresses a
      * compiler warning in the non-PC code path.                        */
-    cRSID_C64instance* c64 = cRSID_init(44100, 0);
+    cRSID_C64instance* c64 = cRSID_init(22050, 0);
     if (!c64) { free(filedata); return NULL; }
 
     /* ── Process the PSID/RSID file ──────────────────────────────────
@@ -99,18 +99,16 @@ void sid_player_close(SidPlayer* sp)
 
 int sid_player_fill(SidPlayer* sp, int16_t* buf, int n_samples)
 {
-    /* SID hardware is mono; we duplicate to interleaved L/R so main.c's
-     * stereo deinterleave path works correctly and the display shows Stereo. */
+    /* SID hardware is mono — output mono samples directly.
+     * main.c's audio callback duplicates mono to both L/R channels. */
     for (int i = 0; i < n_samples; i++) {
-        int16_t s = cRSID_generateSample(sp->c64);
-        buf[i * 2]     = s;  /* L */
-        buf[i * 2 + 1] = s;  /* R */
+        buf[i] = cRSID_generateSample(sp->c64);
     }
     return n_samples;
 }
 
-int         sid_player_channels    (SidPlayer* sp) { (void)sp; return 2;     }
-int         sid_player_sample_rate (SidPlayer* sp) { (void)sp; return 44100; }
+int         sid_player_channels    (SidPlayer* sp) { (void)sp; return 1;     }
+int         sid_player_sample_rate (SidPlayer* sp) { (void)sp; return 22050; }
 int32_t     sid_player_total_samples(SidPlayer* sp){ (void)sp; return 0;     }
 const char* sid_player_title       (SidPlayer* sp) { return sp->title;       }
 const char* sid_player_author      (SidPlayer* sp) { return sp->author;      }

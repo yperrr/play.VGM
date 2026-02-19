@@ -4,7 +4,7 @@ build-mingw/
 build-device/
 
 # Playdate build outputs
-Source/
+Source/pdex.*
 target/
 
 # Cloned third-party repositories
@@ -16,6 +16,7 @@ libs/libxmp/
 .idea/
 .vscode/
 .claude/
+scripts/
 
 # Compiled binaries and objects
 *.o

@@ -26,10 +26,12 @@ typedef struct ModPlayer ModPlayer;
 /**
  * Open a tracker module from the Playdate filesystem.
  * Reads the whole file into RAM, passes it to libxmp for parsing.
+ * If mono is non-zero, output is mixed to mono (1 channel) for better
+ * performance on device; otherwise stereo (2 channels).
  *
  * @return non-NULL on success, NULL on failure.
  */
-ModPlayer* mod_player_open(PlaydateAPI* pd, const char* path);
+ModPlayer* mod_player_open(PlaydateAPI* pd, const char* path, int mono);
 
 /**
  * Free all resources.  Safe to call with NULL.
@@ -37,12 +39,14 @@ ModPlayer* mod_player_open(PlaydateAPI* pd, const char* path);
 void mod_player_close(ModPlayer* mp);
 
 /**
- * Render up to `n_samples` of stereo interleaved 16-bit PCM into `buf`.
+ * Render up to `n_samples` of 16-bit PCM into `buf`.
+ * Mono: n_samples * sizeof(int16_t) bytes.
+ * Stereo: n_samples * 2 * sizeof(int16_t) bytes (interleaved L/R).
  * Returns the number of samples actually rendered, or 0 at end of module.
  */
 int mod_player_fill(ModPlayer* mp, int16_t* buf, int n_samples);
 
-/** Always returns 2 (stereo output). */
+/** Returns 1 (mono) or 2 (stereo) depending on open mode. */
 int mod_player_channels(ModPlayer* mp);
 
 /** Always returns 44100. */
