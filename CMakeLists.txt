@@ -25,9 +25,13 @@ set(CMAKE_XCODE_GENERATE_SCHEME TRUE)
 
 # ── Game name (used by playdate_game.cmake) ─────────────────────────
 set(PLAYDATE_GAME_NAME play.VGM)
-set(PLAYDATE_GAME_DEVICE play.VGM_DEVICE)
+set(PLAYDATE_GAME_DEVICE play.VGM)
 
 project(${PLAYDATE_GAME_NAME} C ASM)
+
+# ── Directory shortcuts ───────────────────────────────────────────────
+set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set(LIBS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/libs)
 
 # ── vgmstream config ───────────────────────────────────────────────
 set(USE_FFMPEG        OFF CACHE BOOL "" FORCE)
@@ -44,12 +48,13 @@ set(BUILD_AUDACIOUS   OFF CACHE BOOL "" FORCE)
 set(BUILD_FB2K        OFF CACHE BOOL "" FORCE)
 set(BUILD_WINAMP      OFF CACHE BOOL "" FORCE)
 set(BUILD_XMPLAY      OFF CACHE BOOL "" FORCE)
+set(BUILD_V123        OFF CACHE BOOL "" FORCE)
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/vgmstream/CMakeLists.txt)
-    add_subdirectory(vgmstream)
+if(EXISTS ${LIBS_DIR}/vgmstream/CMakeLists.txt)
+    add_subdirectory(${LIBS_DIR}/vgmstream ${CMAKE_CURRENT_BINARY_DIR}/vgmstream)
 else()
     message(WARNING
-        "vgmstream not found. Run: git clone https://github.com/vgmstream/vgmstream.git")
+        "vgmstream not found. Run: git clone https://github.com/vgmstream/vgmstream.git libs/vgmstream")
 endif()
 
 # ── SID emulation: cRSID by Hermit (both simulator and device) ───────
@@ -58,17 +63,17 @@ endif()
 # It uses a unity build (libcRSID.c includes all its own sub-files),
 # which is compiled via sid_player_crsid.c.
 #
-# To enable SID playback, clone cRSID into src/crsid/:
-#   git clone https://github.com/r-moeritz/crsid-by-hermit.git src/crsid
+# To enable SID playback, clone cRSID into libs/crsid/:
+#   git clone https://github.com/r-moeritz/crsid-by-hermit.git libs/crsid
 #
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/crsid/libcRSID.c)
-    set(SID_SOURCES sid_player_crsid.c)
-    set(SID_INCDIRS ${CMAKE_CURRENT_SOURCE_DIR}/crsid)
+if(EXISTS ${LIBS_DIR}/crsid/libcRSID.c)
+    set(SID_SOURCES src/sid_player_crsid.c)
+    set(SID_INCDIRS ${LIBS_DIR}/crsid)
 else()
     message(WARNING
         "cRSID not found — SID playback disabled.\n"
         "To enable it, run:\n"
-        "  git clone https://github.com/r-moeritz/crsid-by-hermit.git src/crsid")
+        "  git clone https://github.com/r-moeritz/crsid-by-hermit.git libs/crsid")
     set(SID_SOURCES "")
     set(SID_INCDIRS "")
 endif()
@@ -80,8 +85,8 @@ set(SID_LIBS "")
 # We build the "lite" variant which supports MOD, S3M, XM, IT only
 # (no exotic formats), keeping the binary small for Playdate.
 #
-# To enable tracker playback, clone libxmp into src/libxmp/:
-#   git clone https://github.com/libxmp/libxmp.git src/libxmp
+# To enable tracker playback, clone libxmp into libs/libxmp/:
+#   git clone https://github.com/libxmp/libxmp.git libs/libxmp
 #
 set(BUILD_LITE    ON  CACHE BOOL "" FORCE)
 set(BUILD_STATIC  ON  CACHE BOOL "" FORCE)
@@ -89,16 +94,16 @@ set(BUILD_SHARED  OFF CACHE BOOL "" FORCE)
 set(LIBXMP_DISABLE_DEPACKERS ON CACHE BOOL "" FORCE)
 set(LIBXMP_DISABLE_PROWIZARD ON CACHE BOOL "" FORCE)
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/libxmp/CMakeLists.txt)
-    add_subdirectory(libxmp)
-    set(MOD_SOURCES mod_player.c)
-    set(MOD_INCDIRS ${CMAKE_CURRENT_SOURCE_DIR}/libxmp/include)
+if(EXISTS ${LIBS_DIR}/libxmp/CMakeLists.txt)
+    add_subdirectory(${LIBS_DIR}/libxmp ${CMAKE_CURRENT_BINARY_DIR}/libxmp)
+    set(MOD_SOURCES src/mod_player.c)
+    set(MOD_INCDIRS ${LIBS_DIR}/libxmp/include)
     set(MOD_LIBS xmp_lite_static)
 else()
     message(WARNING
         "libxmp not found — tracker playback disabled.\n"
         "To enable it, run:\n"
-        "  git clone https://github.com/libxmp/libxmp.git src/libxmp")
+        "  git clone https://github.com/libxmp/libxmp.git libs/libxmp")
     set(MOD_SOURCES "")
     set(MOD_INCDIRS "")
     set(MOD_LIBS "")
@@ -106,8 +111,8 @@ endif()
 
 # ── Game sources ─────────────────────────────────────────────────────
 set(GAME_SRC
-    main.c
-    vgm_pd_streamfile.c
+    src/main.c
+    src/vgm_pd_streamfile.c
     ${SID_SOURCES}
     ${MOD_SOURCES}
 )
@@ -117,10 +122,12 @@ if (TOOLCHAIN STREQUAL "armgcc")
     add_executable(${PLAYDATE_GAME_DEVICE}
         ${SDK}/C_API/buildsupport/setup.c
         ${GAME_SRC}
+        src/pd_syscalls.c
     )
     target_include_directories(${PLAYDATE_GAME_DEVICE} PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/vgmstream/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/vgmstream/src/base
+        ${SRC_DIR}
+        ${LIBS_DIR}/vgmstream/src
+        ${LIBS_DIR}/vgmstream/src/base
         ${SID_INCDIRS}
         ${MOD_INCDIRS}
     )
@@ -142,8 +149,9 @@ else()
         ${GAME_SRC}
     )
     target_include_directories(${PLAYDATE_GAME_NAME} PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/vgmstream/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/vgmstream/src/base
+        ${SRC_DIR}
+        ${LIBS_DIR}/vgmstream/src
+        ${LIBS_DIR}/vgmstream/src/base
         ${SID_INCDIRS}
         ${MOD_INCDIRS}
     )
@@ -165,6 +173,13 @@ else()
     endif()
 endif()
 
+# ── PDX output goes into target/sim or target/device ─────────────
+if(TOOLCHAIN STREQUAL "armgcc")
+    set(PRODUCT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/target/device CACHE STRING "Built PDX directory" FORCE)
+else()
+    set(PRODUCT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/target/sim CACHE STRING "Built PDX directory" FORCE)
+endif()
+
 # ── Let SDK set compile flags, packaging, etc. ──────────────────────
 include(${SDK}/C_API/buildsupport/playdate_game.cmake)
 
@@ -177,12 +192,12 @@ endif()
 
 add_custom_command(TARGET ${_PDX_TARGET} PRE_BUILD
     COMMAND ${CMAKE_COMMAND} -E remove_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/${PLAYDATE_GAME_NAME}.pdx"
+        "${PRODUCT_DIR}/${PLAYDATE_GAME_NAME}.pdx"
     COMMENT "Cleaning ${PLAYDATE_GAME_NAME}.pdx/"
 )
 
 add_custom_command(TARGET ${_PDX_TARGET} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
-        "${CMAKE_CURRENT_SOURCE_DIR}/${PLAYDATE_GAME_NAME}.pdx/vgm"
+        "${PRODUCT_DIR}/${PLAYDATE_GAME_NAME}.pdx/vgm"
     COMMENT "Creating ${PLAYDATE_GAME_NAME}.pdx/vgm/"
 )

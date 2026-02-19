@@ -1,7 +1,7 @@
 # ══════════════════════════════════════════════════════════════════════
 # play.VGM — Makefile for simulator (Windows) and device
 #
-# Run from this directory (src/) with PLAYDATE_SDK_PATH set:
+# Run from the project root with PLAYDATE_SDK_PATH set:
 #   export PLAYDATE_SDK_PATH=/mnt/c/Users/YourName/Documents/PlaydateSDK
 #   make          # simulator build (produces play.VGM.pdx)
 #   make device   # ARM device build
@@ -12,7 +12,7 @@ GAME_NAME = play.VGM
 PRODUCT   = $(GAME_NAME).pdx
 
 # ── vgmstream paths ────────────────────────────────────────────────
-VGM_DIR = vgmstream
+VGM_DIR = libs/vgmstream
 VGM_SRC = $(VGM_DIR)/src
 
 # ── Codec flags — disable all heavy codecs ─────────────────────────
@@ -29,9 +29,9 @@ UDEFS = \
 
 # ── Include paths ──────────────────────────────────────────────────
 UINCLUDE = \
-	-I. \
-	-Icrsid \
-	-Ilibxmp/include \
+	-Isrc \
+	-Ilibs/crsid \
+	-Ilibs/libxmp/include \
 	-I$(VGM_SRC) \
 	-I$(VGM_SRC)/base \
 	-I$(VGM_SRC)/coding \
@@ -41,10 +41,10 @@ UINCLUDE = \
 
 # ── Game sources ───────────────────────────────────────────────────
 GAME_FILES = \
-	main.c \
-	vgm_pd_streamfile.c \
-	sid_player_crsid.c \
-	mod_player.c
+	src/main.c \
+	src/vgm_pd_streamfile.c \
+	src/sid_player_crsid.c \
+	src/mod_player.c
 
 # ── vgmstream core sources (minimal ADPCM-only subset) ────────────
 VGM_FILES = \
@@ -80,7 +80,7 @@ include $(SDK)/C_API/buildsupport/common.mk
 help:
 	@echo "play.date ${GAME_NAME}"
 	@echo ""
-	@echo "Run from this directory (src/) with PLAYDATE_SDK_PATH set."
+	@echo "Run from the project root with PLAYDATE_SDK_PATH set."
 	@echo ""
 	@echo "Targets:"
 	@echo "  make          — build for simulator (Windows DLL via MinGW)"

@@ -1,15 +1,16 @@
 # Build directories
 build/
-src/build/
-src/build-mingw/
+build-mingw/
+build-device/
 
 # Playdate build outputs
-src/Source/
-src/*.pdx/
+Source/
+target/
 
 # Cloned third-party repositories
-src/vgmstream/
-src/crsid/
+libs/vgmstream/
+libs/crsid/
+libs/libxmp/
 
 # IDE / editor config
 .idea/

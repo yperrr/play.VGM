@@ -22,7 +22,7 @@
  * Do NOT define CRSID_PLATFORM_PC — it pulls in SDL and stdio file I/O.
  */
 
-#include "crsid/libcRSID.c"   /* unity build — includes C64/ and host/ internals */
+#include "libcRSID.c"   /* unity build — includes C64/ and host/ internals */
 
 #include "sid_player.h"
 #include <stdlib.h>

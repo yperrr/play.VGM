@@ -123,9 +123,6 @@ typedef struct {
     int      vis_enabled;     /* 0 = off, 1 = on */
     int      vis_fullscreen;  /* 0 = inline, 1 = fullscreen */
 
-    /* Crank-based volume (0.0 – 1.0) */
-    float    volume;
-
     /* Title scroll state (marquee for long titles) */
     int      title_scroll_x;     /* current pixel offset */
     int      title_scroll_wait;  /* frames to pause before/after scrolling */
@@ -218,8 +215,8 @@ static int audio_callback(void* context, int16_t* left, int16_t* right, int len)
             }
         }
 
-        /* Copy from ring buffer to output, with optional resampling */
-        float vol = p->volume;
+        /* Copy from ring buffer to output, with optional resampling.
+         * Volume is handled by the SDK's SoundSource setVolume(). */
         int src_consumed = 0;
 
         if (p->resample_step == 0) {
@@ -230,17 +227,15 @@ static int audio_callback(void* context, int16_t* left, int16_t* right, int len)
             if (p->channels == 1) {
                 for (int i = 0; i < to_copy; i++) {
                     int idx = (p->ring_read + i) % DECODE_BUF_SAMPLES;
-                    int16_t s = (int16_t)(p->decode_buf[idx] * vol);
+                    int16_t s = p->decode_buf[idx];
                     left[written + i] = s;
                     if (right) right[written + i] = s;
                 }
             } else {
                 for (int i = 0; i < to_copy; i++) {
                     int idx = (p->ring_read + i) % DECODE_BUF_SAMPLES;
-                    int16_t l = (int16_t)(p->decode_buf[idx * 2]     * vol);
-                    int16_t r = (int16_t)(p->decode_buf[idx * 2 + 1] * vol);
-                    left[written + i] = l;
-                    if (right) right[written + i] = r;
+                    left[written + i]  = p->decode_buf[idx * 2];
+                    if (right) right[written + i] = p->decode_buf[idx * 2 + 1];
                 }
             }
             src_consumed = to_copy;
@@ -262,14 +257,13 @@ static int audio_callback(void* context, int16_t* left, int16_t* right, int len)
 
                 if (p->channels == 1) {
                     int s = p->decode_buf[idx0] + ((p->decode_buf[idx1] - p->decode_buf[idx0]) * f >> 16);
-                    int16_t out = (int16_t)(s * vol);
-                    left[written] = out;
-                    if (right) right[written] = out;
+                    left[written] = (int16_t)s;
+                    if (right) right[written] = (int16_t)s;
                 } else {
                     int l = p->decode_buf[idx0 * 2]     + ((p->decode_buf[idx1 * 2]     - p->decode_buf[idx0 * 2])     * f >> 16);
                     int r = p->decode_buf[idx0 * 2 + 1] + ((p->decode_buf[idx1 * 2 + 1] - p->decode_buf[idx0 * 2 + 1]) * f >> 16);
-                    left[written]  = (int16_t)(l * vol);
-                    if (right) right[written] = (int16_t)(r * vol);
+                    left[written]  = (int16_t)l;
+                    if (right) right[written] = (int16_t)r;
                 }
 
                 written++;
@@ -719,15 +713,7 @@ static void player_draw(void)
         pd->graphics->drawText("PAUSED", 6, kASCIIEncoding, 18, 2);
     }
 
-    /* Volume (right side, white on black) */
-    snprintf(info, sizeof(info), "Vol: %d%%", (int)(p->volume * 100));
-    int vol_w = pd->graphics->getTextWidth(NULL, info, strlen(info),
-                                            kASCIIEncoding, 0);
-    pd->graphics->drawText(info, strlen(info),
-                           kASCIIEncoding, 392 - vol_w, 2);
-    pd->graphics->setDrawMode(kDrawModeCopy);
-
-    /* ── Metadata line (right-aligned, first content row) ─────────── */
+    /* Metadata (right side, white on black) */
     const char* file_ext = strrchr(p->current_file, '.');
     const char* file_type = file_ext ? file_ext + 1 : "???";
 
@@ -741,9 +727,10 @@ static void player_draw(void)
     int meta_w = pd->graphics->getTextWidth(NULL, info, strlen(info),
                                              kASCIIEncoding, 0);
     pd->graphics->drawText(info, strlen(info),
-                           kASCIIEncoding, 388 - meta_w, 26);
+                           kASCIIEncoding, 392 - meta_w, 2);
+    pd->graphics->setDrawMode(kDrawModeCopy);
 
-    /* ── Title (centered, second content row, with marquee) ───────── */
+    /* ── Title (centered, first content row, with marquee) ────────── */
     const char* name;
     if (p->track_title[0] != '\0') {
         name = p->track_title;
@@ -762,7 +749,7 @@ static void player_draw(void)
             /* Fits: center horizontally */
             int title_x = (400 - text_w) / 2;
             pd->graphics->drawText(name, name_len,
-                                   kASCIIEncoding, title_x, 44);
+                                   kASCIIEncoding, title_x, 26);
             p->title_scroll_x = 0;
         } else {
             /* Marquee: scroll left, pause at each end, snap back */
@@ -782,17 +769,17 @@ static void player_draw(void)
                 }
             }
 
-            pd->graphics->setClipRect(12, 44, title_area_w, FONT_HEIGHT);
+            pd->graphics->setClipRect(12, 26, title_area_w, FONT_HEIGHT);
             pd->graphics->drawText(name, name_len, kASCIIEncoding,
-                                   12 - p->title_scroll_x, 44);
+                                   12 - p->title_scroll_x, 26);
             pd->graphics->clearClipRect();
         }
     }
 
     /* ── Centered stack: progress bar + time + waveform ──────────── */
-    /* Available zone: y=64 (below title) to y=216 (above controls) */
+    /* Available zone: y=46 (below title) to y=216 (above controls) */
     {
-        const int zone_top = 64, zone_bot = 216;
+        const int zone_top = 46, zone_bot = 216;
         const int bar_h = 12, time_h = FONT_HEIGHT, gap = 8;
         const int wave_h = 60;  /* ±30px amplitude */
         int has_bar = (p->total_samples > 0);
@@ -856,8 +843,8 @@ static void player_draw(void)
     /* ── Controls help (mirrors hardware: D-pad, B, A, Crank) ────── */
     {
         const char* help = (p->total_samples > 0)
-            ? "<>:Seek  B:Stop  A:Play/Pause  Crank:Vol"
-            : "B:Stop  A:Play/Pause  Crank:Vol";
+            ? "<>:Seek  B:Stop  A:Play/Pause"
+            : "B:Stop  A:Play/Pause";
         int help_w = pd->graphics->getTextWidth(NULL, help, strlen(help),
                                                  kASCIIEncoding, 0);
         pd->graphics->drawText(help, strlen(help),
@@ -941,15 +928,6 @@ static void handle_input(void)
 
     PDButtons pushed, current;
     pd->system->getButtonState(&current, &pushed, NULL);
-
-    /* Crank → volume control */
-    float crank_change = pd->system->getCrankChange();
-    if (crank_change != 0.0f) {
-        p->volume += crank_change / 360.0f;
-        if (p->volume < 0.0f) p->volume = 0.0f;
-        if (p->volume > 1.0f) p->volume = 1.0f;
-        p->needs_redraw = 1;
-    }
 
     switch (p->state) {
     case STATE_BROWSER:
@@ -1040,7 +1018,6 @@ static void player_init(PlaydateAPI* pd)
     memset(&g_player, 0, sizeof(VGMPlayer));
     g_player.pd     = pd;
     g_player.state  = STATE_BROWSER;
-    g_player.volume = 0.8f;
     g_player.vis_enabled = 1;
     g_player.needs_redraw = 1;
 

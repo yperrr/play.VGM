@@ -1,5 +1,0 @@
-name=play.VGM
-author=yperr
-description=VGM player using the vgmstream library
-bundleID=fr.yperr.play.vgm
-version=1.0
