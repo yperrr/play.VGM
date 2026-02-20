@@ -860,15 +860,26 @@ static void player_draw(void)
     /* ── Header bar (black) ───────────────────────────────────────── */
     pd->graphics->fillRect(0, 0, 400, 20, kColorBlack);
 
-    /* Play/pause icon + status text (left side, white on black) */
-    if (p->state == STATE_PLAYING) {
-        draw_play_icon(pd, 6, 4, kColorWhite);
-        pd->graphics->setDrawMode(kDrawModeInverted);
-        pd->graphics->drawText("PLAYING", 7, kASCIIEncoding, 18, 2);
-    } else {
-        draw_pause_icon(pd, 6, 4, kColorWhite);
-        pd->graphics->setDrawMode(kDrawModeInverted);
-        pd->graphics->drawText("PAUSED", 6, kASCIIEncoding, 18, 2);
+    /* Play/pause icon + status text for Shuffle/Repeat (left side, white on black) */
+    draw_play_icon(pd, 6, 4, kColorWhite);
+    
+    /* Display Shuffle and/or Repeat status */
+    pd->graphics->setDrawMode(kDrawModeInverted);
+    const char* status_text = NULL;
+    if (p->shuffle_enabled && p->repeat_mode == 2) {
+        status_text = "Shuffle + Repeat";
+    } else if (p->shuffle_enabled && p->repeat_mode == 1) {
+        status_text = "Shuffle + Repeat (1)";
+    } else if (p->shuffle_enabled) {
+        status_text = "Shuffle";
+    } else if (p->repeat_mode == 2) {
+        status_text = "Repeat";
+    } else if (p->repeat_mode == 1) {
+        status_text = "Repeat (1)";
+    }
+    
+    if (status_text) {
+        pd->graphics->drawText(status_text, strlen(status_text), kASCIIEncoding, 18, 2);
     }
 
     /* Metadata (right side, white on black) */
