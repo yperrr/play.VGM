@@ -135,6 +135,7 @@ typedef struct {
     PDMenuItem* menu_vis_toggle;
     PDMenuItem* menu_vis_fs;
     PDMenuItem* menu_mono;
+    int      menu_items_created;  /* 1 = menu items are currently visible, 0 = hidden */
 
     /* Audio mode */
     int      force_mono;     /* 1 = mono output (default, better perf), 0 = stereo */
@@ -154,6 +155,11 @@ static void player_play(void);
 static void player_pause(void);
 static void player_stop(void);
 static void player_seek(int32_t sample);
+
+/* Menu callback functions */
+static void menu_vis_toggle(void* userdata);
+static void menu_vis_fullscreen(void* userdata);
+static void menu_mono_toggle(void* userdata);
 
 static inline int ring_avail(VGMPlayer* p) {
     return (p->ring_write - p->ring_read + RING_BUF_SAMPLES) % RING_BUF_SAMPLES;
@@ -555,8 +561,21 @@ static void player_play(void)
         );
     }
 
+    /* Show player control menu items when starting playback */
+    if (!p->menu_items_created) {
+        p->menu_vis_toggle = p->pd->system->addCheckmarkMenuItem(
+            "Visualizer", 1, menu_vis_toggle, p);
+        p->menu_vis_fs = p->pd->system->addCheckmarkMenuItem(
+            "Fullscreen Viz", 0, menu_vis_fullscreen, p);
+        p->menu_mono = p->pd->system->addCheckmarkMenuItem(
+            "Mono output", 1, menu_mono_toggle, p);
+        p->menu_items_created = 1;
+    }
+
     p->state = STATE_PLAYING;
     p->stream_ended = 0;
+    /* Disable auto-lock while playing so screen doesn't sleep */
+    p->pd->system->setAutoLockDisabled(1);
     /* Higher refresh rate = more update() calls = more decode opportunities.
      * 50 fps gives ~20 ms per frame instead of ~33 ms at 30 fps. */
     p->pd->display->setRefreshRate(50);
@@ -579,6 +598,15 @@ static void player_stop(void)
         p->pd->sound->removeSource(p->audio_source);
         p->audio_source = NULL;
     }
+    /* Hide player control menu items when returning to browser */
+    if (p->menu_items_created) {
+        p->pd->system->removeMenuItem(p->menu_vis_toggle);
+        p->pd->system->removeMenuItem(p->menu_vis_fs);
+        p->pd->system->removeMenuItem(p->menu_mono);
+        p->menu_items_created = 0;
+    }
+    /* Re-enable auto-lock when stopping */
+    p->pd->system->setAutoLockDisabled(0);
     player_close();
     p->pd->display->setRefreshRate(30);  /* restore normal rate for browser */
     p->state = STATE_BROWSER;
@@ -1102,13 +1130,7 @@ static void player_init(PlaydateAPI* pd)
     /* Initialise Playdate filesystem adapter for vgmstream */
     vgm_pd_streamfile_set_api(pd);
 
-    /* System menu items */
-    g_player.menu_vis_toggle = pd->system->addCheckmarkMenuItem(
-        "Visualizer", 1, menu_vis_toggle, &g_player);
-    g_player.menu_vis_fs = pd->system->addCheckmarkMenuItem(
-        "Fullscreen Viz", 0, menu_vis_fullscreen, &g_player);
-    g_player.menu_mono = pd->system->addCheckmarkMenuItem(
-        "Mono output", 1, menu_mono_toggle, &g_player);
+    /* Menu items will be created when playback starts */
 
     /* Scan for audio files */
     browser_scan("vgm");
