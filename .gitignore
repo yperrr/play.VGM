@@ -4,7 +4,8 @@ build-mingw/
 build-device/
 
 # Playdate build outputs
-Source/pdex.*
+Source/
+!Source/pdxinfo
 target/
 
 # Cloned third-party repositories

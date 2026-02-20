@@ -229,3 +229,12 @@ add_custom_command(TARGET ${_PDX_TARGET} POST_BUILD
         "${PRODUCT_DIR}/${PLAYDATE_GAME_NAME}.pdx/vgm"
     COMMENT "Creating ${PLAYDATE_GAME_NAME}.pdx/vgm/"
 )
+
+# ── Device only: remove pdex.dll to prevent stale simulator binary ────
+if(TOOLCHAIN STREQUAL "armgcc")
+    add_custom_command(TARGET ${_PDX_TARGET} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E remove
+            "${PRODUCT_DIR}/${PLAYDATE_GAME_NAME}.pdx/pdex.dll"
+        COMMENT "Removing pdex.dll from device PDX"
+    )
+endif()

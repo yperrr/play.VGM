@@ -119,7 +119,23 @@ typedef struct {
     int         browser_count;
     char        browser_files[BROWSER_MAX_FILES][MAX_PATH];
     char        current_file[MAX_PATH];
+    int         current_song_index;  /* index in browser_files for current song */
     char        error_msg[128];
+
+    /* Playback modes */
+    int         repeat_mode;    /* 0=off, 1=track, 2=all */
+    int         shuffle_enabled; /* 0=off, 1=on */
+    int         shuffle_all;     /* 0=directory only, 1=all directories */
+    int         shuffled_indices[BROWSER_MAX_FILES];
+    int         shuffled_count;
+
+    /* Previous/next song display with scrolling */
+    char        prev_title[128];
+    int         prev_scroll_x;
+    int         prev_scroll_wait;
+    char        next_title[128];
+    int         next_scroll_x;
+    int         next_scroll_wait;
 
     /* Visualization buffer — snapshot of audio output (left channel) */
     int16_t  vis_buf[VIS_SAMPLES];
@@ -131,10 +147,18 @@ typedef struct {
     int      title_scroll_x;     /* current pixel offset */
     int      title_scroll_wait;  /* frames to pause before/after scrolling */
 
+    /* Button bar state */
+    struct {
+        int x, y, w, h;  /* position and size */
+    } buttons[7];  /* 0=prev, 1=seek_back, 2=play_pause, 3=seek_fwd, 4=next, 5=shuffle, 6=repeat */
+    int selected_button;  /* 0-6 = currently selected button */
+
     /* System menu items */
     PDMenuItem* menu_vis_toggle;
     PDMenuItem* menu_vis_fs;
     PDMenuItem* menu_mono;
+    PDMenuItem* menu_repeat;
+    PDMenuItem* menu_shuffle;
     int      menu_items_created;  /* 1 = menu items are currently visible, 0 = hidden */
 
     /* Audio mode */
@@ -160,6 +184,13 @@ static void player_seek(int32_t sample);
 static void menu_vis_toggle(void* userdata);
 static void menu_vis_fullscreen(void* userdata);
 static void menu_mono_toggle(void* userdata);
+static void menu_repeat_cycle(void* userdata);
+static void menu_shuffle_toggle(void* userdata);
+
+/* Playback mode helpers */
+static void shuffle_files(VGMPlayer* p);
+static int get_next_song_index(VGMPlayer* p);
+static void update_prev_next_display(VGMPlayer* p);
 
 static inline int ring_avail(VGMPlayer* p) {
     return (p->ring_write - p->ring_read + RING_BUF_SAMPLES) % RING_BUF_SAMPLES;
@@ -172,6 +203,10 @@ static void player_prefill_audio(float budget);
 static void browser_scan(const char* directory);
 static void browser_draw(void);
 static void player_draw(void);
+static void draw_button_bar(PlaydateAPI* pd, VGMPlayer* p);
+static int  check_button_click(VGMPlayer* p, int x, int y);
+static void draw_button_bar(PlaydateAPI* pd, VGMPlayer* p);
+static int  check_button_click(VGMPlayer* p, int x, int y);
 static void vis_fullscreen_draw(void);
 static void error_draw(void);
 
@@ -359,10 +394,39 @@ static void player_prefill_audio(float budget)
             break;
     }
 
-    /* If stream ended and ring buffer is empty, return to browser */
+    /* If stream ended and ring buffer is empty, handle repeat/auto-play logic */
     if (p->stream_ended && ring_avail(p) <= 0 && !p->sid) {
-        p->state = STATE_BROWSER;
-        p->needs_redraw = 1;
+        /* Repeat mode: track = 1, all = 2, off = 0 */
+        if (p->repeat_mode == 1) {
+            /* Repeat current track */
+            if (player_open_file(p->current_file)) {
+                player_play();
+            } else {
+                p->state = STATE_BROWSER;
+                p->needs_redraw = 1;
+            }
+        } else if (p->repeat_mode == 2 || (p->repeat_mode == 0 && p->current_song_index >= 0)) {
+            /* Play next song (if available) */
+            int next_idx = get_next_song_index(p);
+            if (next_idx >= 0 && next_idx < p->browser_count) {
+                p->current_song_index = next_idx;
+                if (player_open_file(p->browser_files[next_idx])) {
+                    update_prev_next_display(p);
+                    player_play();
+                } else {
+                    p->state = STATE_BROWSER;
+                    p->needs_redraw = 1;
+                }
+            } else {
+                /* No next song, return to browser */
+                p->state = STATE_BROWSER;
+                p->needs_redraw = 1;
+            }
+        } else {
+            /* Repeat off and no next song, return to browser */
+            p->state = STATE_BROWSER;
+            p->needs_redraw = 1;
+        }
     }
 }
 
@@ -563,12 +627,24 @@ static void player_play(void)
 
     /* Show player control menu items when starting playback */
     if (!p->menu_items_created) {
+        /* ── Display options (main menu) ── */
         p->menu_vis_toggle = p->pd->system->addCheckmarkMenuItem(
-            "Visualizer", 1, menu_vis_toggle, p);
+            "Display: Visualizer", 1, menu_vis_toggle, p);
         p->menu_vis_fs = p->pd->system->addCheckmarkMenuItem(
-            "Fullscreen Viz", 0, menu_vis_fullscreen, p);
+            "Display: Fullscreen", 0, menu_vis_fullscreen, p);
         p->menu_mono = p->pd->system->addCheckmarkMenuItem(
-            "Mono output", 1, menu_mono_toggle, p);
+            "Audio: Mono Output", 1, menu_mono_toggle, p);
+        
+        /* ── Playing Mode options ── */
+        p->menu_repeat = p->pd->system->addOptionsMenuItem(
+            "Playing: Repeat",
+            (const char** const)&(const char*[]){"Off", "Single", "All"},
+            3, menu_repeat_cycle, p);
+        p->menu_shuffle = p->pd->system->addOptionsMenuItem(
+            "Playing: Shuffle",
+            (const char** const)&(const char*[]){"Off", "Directory", "All"},
+            3, menu_shuffle_toggle, p);
+        
         p->menu_items_created = 1;
     }
 
@@ -603,6 +679,8 @@ static void player_stop(void)
         p->pd->system->removeMenuItem(p->menu_vis_toggle);
         p->pd->system->removeMenuItem(p->menu_vis_fs);
         p->pd->system->removeMenuItem(p->menu_mono);
+        p->pd->system->removeMenuItem(p->menu_repeat);
+        p->pd->system->removeMenuItem(p->menu_shuffle);
         p->menu_items_created = 0;
     }
     /* Re-enable auto-lock when stopping */
@@ -810,6 +888,91 @@ static void player_draw(void)
                            kASCIIEncoding, 392 - meta_w, 2);
     pd->graphics->setDrawMode(kDrawModeCopy);
 
+    /* ── Previous/Next song display (top corners) ────────────────── */
+    {
+        const int title_max_w = 80;        /* increased from 60 for larger display */
+        const int y_prev_next = 24;        /* moved down slightly for better spacing */
+        const int label_gap = 5;           /* space between label and title */
+
+        /* Previous song (left side) */
+        if (p->prev_title[0] != '\0') {
+            int prev_label_w = pd->graphics->getTextWidth(NULL, "Prev:", 5,
+                                                           kASCIIEncoding, 0);
+            pd->graphics->drawText("Prev:", 5, kASCIIEncoding, 6, y_prev_next);
+            int prev_title_x = 6 + prev_label_w + label_gap;  /* label + gap */
+
+            int prev_len = (int)strlen(p->prev_title);
+            int prev_w = pd->graphics->getTextWidth(NULL, p->prev_title, prev_len,
+                                                     kASCIIEncoding, 0);
+
+            if (prev_w <= title_max_w) {
+                pd->graphics->drawText(p->prev_title, prev_len,
+                                       kASCIIEncoding, prev_title_x, y_prev_next);
+                p->prev_scroll_x = 0;
+            } else {
+                int max_scroll = prev_w - title_max_w;
+                if (p->prev_scroll_wait > 0) {
+                    p->prev_scroll_wait--;
+                    if (p->prev_scroll_wait == 0 && p->prev_scroll_x >= max_scroll) {
+                        p->prev_scroll_x = 0;
+                        p->prev_scroll_wait = 60;
+                    }
+                } else {
+                    p->prev_scroll_x += 2;
+                    if (p->prev_scroll_x >= max_scroll) {
+                        p->prev_scroll_x = max_scroll;
+                        p->prev_scroll_wait = 60;
+                    }
+                }
+                pd->graphics->setClipRect(prev_title_x, 24, title_max_w, FONT_HEIGHT);
+                pd->graphics->drawText(p->prev_title, prev_len, kASCIIEncoding,
+                                       prev_title_x - p->prev_scroll_x, y_prev_next);
+                pd->graphics->clearClipRect();
+            }
+        }
+
+        /* Next song (right side) */
+        if (p->next_title[0] != '\0') {
+            /* Draw "Next:" label with proper spacing from title */
+            int next_label_w = pd->graphics->getTextWidth(NULL, "Next:", 5,
+                                                           kASCIIEncoding, 0);
+            int next_label_x = 400 - 6 - title_max_w - next_label_w - label_gap;
+            pd->graphics->drawText("Next:", 5, kASCIIEncoding, next_label_x, y_prev_next);
+
+            int next_len = (int)strlen(p->next_title);
+            int next_w = pd->graphics->getTextWidth(NULL, p->next_title, next_len,
+                                                     kASCIIEncoding, 0);
+            int next_title_left = next_label_x + next_label_w + label_gap;  /* label + gap */
+            int next_right = 400 - 6;  /* right edge with 6px margin */
+
+            if (next_w <= title_max_w) {
+                int next_x = next_right - next_w;
+                pd->graphics->drawText(p->next_title, next_len,
+                                       kASCIIEncoding, next_x, y_prev_next);
+                p->next_scroll_x = 0;
+            } else {
+                int max_scroll = next_w - title_max_w;
+                if (p->next_scroll_wait > 0) {
+                    p->next_scroll_wait--;
+                    if (p->next_scroll_wait == 0 && p->next_scroll_x >= max_scroll) {
+                        p->next_scroll_x = 0;
+                        p->next_scroll_wait = 60;
+                    }
+                } else {
+                    p->next_scroll_x += 2;
+                    if (p->next_scroll_x >= max_scroll) {
+                        p->next_scroll_x = max_scroll;
+                        p->next_scroll_wait = 60;
+                    }
+                }
+                pd->graphics->setClipRect(next_title_left, 24, title_max_w, FONT_HEIGHT);
+                pd->graphics->drawText(p->next_title, next_len, kASCIIEncoding,
+                                       next_right - next_w + p->next_scroll_x, y_prev_next);
+                pd->graphics->clearClipRect();
+            }
+        }
+    }
+
     /* ── Title (centered, first content row, with marquee) ────────── */
     const char* name;
     if (p->track_title[0] != '\0') {
@@ -824,12 +987,13 @@ static void player_draw(void)
         int text_w = pd->graphics->getTextWidth(NULL, name, name_len,
                                                  kASCIIEncoding, 0);
         const int title_area_w = 376;  /* 400 - 12px margin each side */
+        const int title_y = 72;        /* right above seek bar at y=84 */
 
         if (text_w <= title_area_w) {
             /* Fits: center horizontally */
             int title_x = (400 - text_w) / 2;
             pd->graphics->drawText(name, name_len,
-                                   kASCIIEncoding, title_x, 26);
+                                   kASCIIEncoding, title_x, title_y);
             p->title_scroll_x = 0;
         } else {
             /* Marquee: scroll left, pause at each end, snap back */
@@ -849,17 +1013,17 @@ static void player_draw(void)
                 }
             }
 
-            pd->graphics->setClipRect(12, 26, title_area_w, FONT_HEIGHT);
+            pd->graphics->setClipRect(12, title_y, title_area_w, FONT_HEIGHT);
             pd->graphics->drawText(name, name_len, kASCIIEncoding,
-                                   12 - p->title_scroll_x, 26);
+                                   12 - p->title_scroll_x, title_y);
             pd->graphics->clearClipRect();
         }
     }
 
     /* ── Centered stack: progress bar + time + waveform ──────────── */
-    /* Available zone: y=46 (below title) to y=216 (above controls) */
+    /* Available zone: y=84 (below title at y=58+FONT_HEIGHT+15px margin) to y=216 (above controls) */
     {
-        const int zone_top = 46, zone_bot = 216;
+        const int zone_top = 84, zone_bot = 216;
         const int bar_h = 12, time_h = FONT_HEIGHT, gap = 8;
         const int wave_h = 60;  /* ±30px amplitude */
         int has_bar = (p->total_samples > 0);
@@ -920,16 +1084,180 @@ static void player_draw(void)
         }
     }
 
-    /* ── Controls help (mirrors hardware: D-pad, B, A, Crank) ────── */
-    {
-        const char* help = (p->total_samples > 0)
-            ? "<>:Seek  B:Stop  A:Play/Pause"
-            : "B:Stop  A:Play/Pause";
-        int help_w = pd->graphics->getTextWidth(NULL, help, strlen(help),
-                                                 kASCIIEncoding, 0);
-        pd->graphics->drawText(help, strlen(help),
-                               kASCIIEncoding, (400 - help_w) / 2, 222);
+    /* ── Button bar (visual icons) ──────────────────────────────── */
+    draw_button_bar(pd, p);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * BUTTON BAR DRAWING
+ * ══════════════════════════════════════════════════════════════════════ */
+
+static void draw_triangle_right(PlaydateAPI* pd, int cx, int cy, int size, int color) {
+    /* Right-pointing triangle using lines */
+    int x1 = cx - size/2, y1 = cy - size/2;
+    int x2 = cx + size/2, y2 = cy;
+    int x3 = cx - size/2, y3 = cy + size/2;
+    pd->graphics->drawLine(x1, y1, x2, y2, 1, color);
+    pd->graphics->drawLine(x2, y2, x3, y3, 1, color);
+    pd->graphics->drawLine(x3, y3, x1, y1, 1, color);
+}
+
+static void draw_triangle_left(PlaydateAPI* pd, int cx, int cy, int size, int color) {
+    /* Left-pointing triangle using lines */
+    int x1 = cx + size/2, y1 = cy - size/2;
+    int x2 = cx - size/2, y2 = cy;
+    int x3 = cx + size/2, y3 = cy + size/2;
+    pd->graphics->drawLine(x1, y1, x2, y2, 1, color);
+    pd->graphics->drawLine(x2, y2, x3, y3, 1, color);
+    pd->graphics->drawLine(x3, y3, x1, y1, 1, color);
+}
+
+static void draw_button_bar(PlaydateAPI* pd, VGMPlayer* p) {
+    const int bar_y = 216;
+    const int bar_h = 24;
+    const int btn_w = 50;
+    const int btn_h = 20;
+    const int spacing = 4;
+    const int total_w = 7 * btn_w + 6 * spacing;
+    const int start_x = (400 - total_w) / 2;
+
+    /* Initialize button positions and selected button on first call */
+    if (p->buttons[0].w == 0) {
+        for (int i = 0; i < 7; i++) {
+            p->buttons[i].x = start_x + i * (btn_w + spacing);
+            p->buttons[i].y = bar_y + 2;
+            p->buttons[i].w = btn_w;
+            p->buttons[i].h = btn_h;
+        }
+        p->selected_button = 2;  /* Start with play/pause button selected */
     }
+
+    /* Draw bar background */
+    pd->graphics->fillRect(0, bar_y, 400, bar_h, kColorWhite);
+    pd->graphics->drawLine(0, bar_y, 400, bar_y, 1, kColorBlack);
+
+    int icon_size = 8;  /* size of drawn icons */
+    int cx, cy;
+
+    /* Button 0: Previous track (|◀◀) */
+    cx = p->buttons[0].x + p->buttons[0].w / 2;
+    cy = p->buttons[0].y + p->buttons[0].h / 2;
+    if (p->selected_button == 0) {
+        pd->graphics->fillRect(p->buttons[0].x, p->buttons[0].y, p->buttons[0].w, p->buttons[0].h, kColorBlack);
+        pd->graphics->fillRect(cx - 9, cy - 5, 2, 10, kColorWhite);
+        draw_triangle_left(pd, cx - 3, cy, icon_size, kColorWhite);
+        draw_triangle_left(pd, cx + 4, cy, icon_size, kColorWhite);
+    } else {
+        pd->graphics->drawRect(p->buttons[0].x, p->buttons[0].y, p->buttons[0].w, p->buttons[0].h, kColorBlack);
+        pd->graphics->fillRect(cx - 9, cy - 5, 2, 10, kColorBlack);
+        draw_triangle_left(pd, cx - 3, cy, icon_size, kColorBlack);
+        draw_triangle_left(pd, cx + 4, cy, icon_size, kColorBlack);
+    }
+
+    /* Button 1: Seek backward (◄◄) */
+    cx = p->buttons[1].x + p->buttons[1].w / 2;
+    cy = p->buttons[1].y + p->buttons[1].h / 2;
+    if (p->selected_button == 1) {
+        pd->graphics->fillRect(p->buttons[1].x, p->buttons[1].y, p->buttons[1].w, p->buttons[1].h, kColorBlack);
+        draw_triangle_left(pd, cx - 3, cy, icon_size, kColorWhite);
+        draw_triangle_left(pd, cx + 3, cy, icon_size, kColorWhite);
+    } else {
+        pd->graphics->drawRect(p->buttons[1].x, p->buttons[1].y, p->buttons[1].w, p->buttons[1].h, kColorBlack);
+        draw_triangle_left(pd, cx - 3, cy, icon_size, kColorBlack);
+        draw_triangle_left(pd, cx + 3, cy, icon_size, kColorBlack);
+    }
+
+    /* Button 2: Play/Pause */
+    cx = p->buttons[2].x + p->buttons[2].w / 2;
+    cy = p->buttons[2].y + p->buttons[2].h / 2;
+    if (p->selected_button == 2) {
+        pd->graphics->fillRect(p->buttons[2].x, p->buttons[2].y, p->buttons[2].w, p->buttons[2].h, kColorBlack);
+        if (p->state == STATE_PLAYING) {
+            /* Pause icon: two vertical bars (white) */
+            pd->graphics->fillRect(cx - 4, cy - 4, 2, 8, kColorWhite);
+            pd->graphics->fillRect(cx + 2, cy - 4, 2, 8, kColorWhite);
+        } else {
+            /* Play icon: right triangle (white) */
+            draw_triangle_right(pd, cx, cy, icon_size, kColorWhite);
+        }
+    } else {
+        pd->graphics->drawRect(p->buttons[2].x, p->buttons[2].y, p->buttons[2].w, p->buttons[2].h, kColorBlack);
+        if (p->state == STATE_PLAYING) {
+            /* Pause icon: two vertical bars (black) */
+            pd->graphics->fillRect(cx - 4, cy - 4, 2, 8, kColorBlack);
+            pd->graphics->fillRect(cx + 2, cy - 4, 2, 8, kColorBlack);
+        } else {
+            /* Play icon: right triangle (black) */
+            draw_triangle_right(pd, cx, cy, icon_size, kColorBlack);
+        }
+    }
+
+    /* Button 3: Seek forward (►►) */
+    cx = p->buttons[3].x + p->buttons[3].w / 2;
+    cy = p->buttons[3].y + p->buttons[3].h / 2;
+    if (p->selected_button == 3) {
+        pd->graphics->fillRect(p->buttons[3].x, p->buttons[3].y, p->buttons[3].w, p->buttons[3].h, kColorBlack);
+        draw_triangle_right(pd, cx - 3, cy, icon_size, kColorWhite);
+        draw_triangle_right(pd, cx + 3, cy, icon_size, kColorWhite);
+    } else {
+        pd->graphics->drawRect(p->buttons[3].x, p->buttons[3].y, p->buttons[3].w, p->buttons[3].h, kColorBlack);
+        draw_triangle_right(pd, cx - 3, cy, icon_size, kColorBlack);
+        draw_triangle_right(pd, cx + 3, cy, icon_size, kColorBlack);
+    }
+
+    /* Button 4: Next track (►►|) */
+    cx = p->buttons[4].x + p->buttons[4].w / 2;
+    cy = p->buttons[4].y + p->buttons[4].h / 2;
+    if (p->selected_button == 4) {
+        pd->graphics->fillRect(p->buttons[4].x, p->buttons[4].y, p->buttons[4].w, p->buttons[4].h, kColorBlack);
+        draw_triangle_right(pd, cx - 4, cy, icon_size, kColorWhite);
+        draw_triangle_right(pd, cx + 3, cy, icon_size, kColorWhite);
+        pd->graphics->fillRect(cx + 7, cy - 5, 2, 10, kColorWhite);
+    } else {
+        pd->graphics->drawRect(p->buttons[4].x, p->buttons[4].y, p->buttons[4].w, p->buttons[4].h, kColorBlack);
+        draw_triangle_right(pd, cx - 4, cy, icon_size, kColorBlack);
+        draw_triangle_right(pd, cx + 3, cy, icon_size, kColorBlack);
+        pd->graphics->fillRect(cx + 7, cy - 5, 2, 10, kColorBlack);
+    }
+
+    /* Button 5: Shuffle */
+    cx = p->buttons[5].x + p->buttons[5].w / 2;
+    cy = p->buttons[5].y + p->buttons[5].h / 2;
+    if (p->shuffle_enabled || p->selected_button == 5) {
+        pd->graphics->fillRect(p->buttons[5].x, p->buttons[5].y, p->buttons[5].w, p->buttons[5].h, kColorBlack);
+        pd->graphics->setDrawMode(kDrawModeInverted);
+        pd->graphics->drawText("S", 1, kASCIIEncoding, cx - 3, cy - 8);
+        pd->graphics->setDrawMode(kDrawModeCopy);
+    } else {
+        pd->graphics->drawRect(p->buttons[5].x, p->buttons[5].y, p->buttons[5].w, p->buttons[5].h, kColorBlack);
+        pd->graphics->drawText("S", 1, kASCIIEncoding, cx - 3, cy - 8);
+    }
+
+
+
+    /* Button 6: Repeat */
+    cx = p->buttons[6].x + p->buttons[6].w / 2;
+    cy = p->buttons[6].y + p->buttons[6].h / 2;
+    if (p->repeat_mode > 0 || p->selected_button == 6) {
+        pd->graphics->fillRect(p->buttons[6].x, p->buttons[6].y, p->buttons[6].w, p->buttons[6].h, kColorBlack);
+        pd->graphics->setDrawMode(kDrawModeInverted);
+        pd->graphics->drawText("R", 1, kASCIIEncoding, cx - 3, cy - 8);
+        pd->graphics->setDrawMode(kDrawModeCopy);
+    } else {
+        pd->graphics->drawRect(p->buttons[6].x, p->buttons[6].y, p->buttons[6].w, p->buttons[6].h, kColorBlack);
+        pd->graphics->drawText("R", 1, kASCIIEncoding, cx - 3, cy - 8);
+    }
+
+}
+
+static int check_button_click(VGMPlayer* p, int x, int y) {
+    for (int i = 0; i < 7; i++) {
+        if (x >= p->buttons[i].x && x < p->buttons[i].x + p->buttons[i].w &&
+            y >= p->buttons[i].y && y < p->buttons[i].y + p->buttons[i].h) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 static void vis_fullscreen_draw(void)
@@ -980,6 +1308,102 @@ static void vis_fullscreen_draw(void)
     pd->graphics->setDrawMode(kDrawModeCopy);
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+ * PLAYBACK MODE HELPERS
+ * ══════════════════════════════════════════════════════════════════════ */
+
+static void shuffle_files(VGMPlayer* p) {
+    p->shuffled_count = p->browser_count;
+    for (int i = 0; i < p->browser_count; i++) {
+        p->shuffled_indices[i] = i;
+    }
+    /* Fisher-Yates shuffle using rand() for randomness */
+    for (int i = p->browser_count - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int tmp = p->shuffled_indices[i];
+        p->shuffled_indices[i] = p->shuffled_indices[j];
+        p->shuffled_indices[j] = tmp;
+    }
+}
+
+static int get_next_song_index(VGMPlayer* p) {
+    if (p->browser_count == 0) return -1;
+    if (p->current_song_index < 0) return 0;
+    
+    int next_idx = -1;
+    
+    if (p->shuffle_enabled) {
+        /* Find current song in shuffled list */
+        int pos = -1;
+        for (int i = 0; i < p->shuffled_count; i++) {
+            if (p->shuffled_indices[i] == p->current_song_index) {
+                pos = i;
+                break;
+            }
+        }
+        if (pos >= 0 && pos < p->shuffled_count - 1) {
+            next_idx = p->shuffled_indices[pos + 1];
+        } else if (p->repeat_mode == 2) {
+            /* Repeat all: reshuffle and start from beginning */
+            shuffle_files(p);
+            next_idx = (p->shuffled_count > 0) ? p->shuffled_indices[0] : -1;
+        }
+    } else {
+        if (p->current_song_index < p->browser_count - 1) {
+            next_idx = p->current_song_index + 1;
+        } else if (p->repeat_mode == 2) {
+            /* Repeat all: go to first song */
+            next_idx = 0;
+        }
+    }
+    
+    return next_idx;
+}
+
+static void update_prev_next_display(VGMPlayer* p) {
+    /* Get previous song index */
+    int prev_idx = -1;
+    if (p->shuffle_enabled) {
+        for (int i = 0; i < p->shuffled_count; i++) {
+            if (p->shuffled_indices[i] == p->current_song_index && i > 0) {
+                prev_idx = p->shuffled_indices[i - 1];
+                break;
+            }
+        }
+    } else {
+        if (p->current_song_index > 0) {
+            prev_idx = p->current_song_index - 1;
+        }
+    }
+
+    /* Get next song index */
+    int next_idx = get_next_song_index(p);
+
+    /* Extract file names for previous song */
+    if (prev_idx >= 0 && prev_idx < p->browser_count) {
+        const char* name = strrchr(p->browser_files[prev_idx], '/');
+        name = name ? name + 1 : p->browser_files[prev_idx];
+        strncpy(p->prev_title, name, sizeof(p->prev_title) - 1);
+        p->prev_title[sizeof(p->prev_title) - 1] = '\0';
+        p->prev_scroll_x = 0;
+        p->prev_scroll_wait = 60;
+    } else {
+        p->prev_title[0] = '\0';
+    }
+
+    /* Extract file names for next song */
+    if (next_idx >= 0 && next_idx < p->browser_count) {
+        const char* name = strrchr(p->browser_files[next_idx], '/');
+        name = name ? name + 1 : p->browser_files[next_idx];
+        strncpy(p->next_title, name, sizeof(p->next_title) - 1);
+        p->next_title[sizeof(p->next_title) - 1] = '\0';
+        p->next_scroll_x = 0;
+        p->next_scroll_wait = 60;
+    } else {
+        p->next_title[0] = '\0';
+    }
+}
+
 static void error_draw(void)
 {
     VGMPlayer* p = &g_player;
@@ -1022,7 +1446,12 @@ static void handle_input(void)
         }
         if (pushed & kButtonA) {
             if (p->browser_count > 0) {
+                p->current_song_index = p->browser_selection;
+                if (p->shuffle_enabled) {
+                    shuffle_files(p);
+                }
                 if (player_open_file(p->browser_files[p->browser_selection])) {
+                    update_prev_next_display(p);
                     player_play();
                 }
             }
@@ -1030,37 +1459,167 @@ static void handle_input(void)
         break;
 
     case STATE_PLAYING:
+        /* D-pad left/right → cycle through button bar */
+        if (pushed & kButtonLeft) {
+            p->selected_button = (p->selected_button - 1 + 7) % 7;
+            p->needs_redraw = 1;
+        }
+        if (pushed & kButtonRight) {
+            p->selected_button = (p->selected_button + 1) % 7;
+            p->needs_redraw = 1;
+        }
+        /* A button → activate selected button */
         if (pushed & kButtonA) {
-            player_pause();
+            switch (p->selected_button) {
+                case 0: { /* Previous track */
+                    if (p->browser_count > 0 && p->current_song_index >= 0) {
+                        int prev_idx = -1;
+                        if (p->shuffle_enabled) {
+                            for (int i = 0; i < p->shuffled_count; i++) {
+                                if (p->shuffled_indices[i] == p->current_song_index && i > 0) {
+                                    prev_idx = p->shuffled_indices[i - 1];
+                                    break;
+                                }
+                            }
+                        } else {
+                            if (p->current_song_index > 0) {
+                                prev_idx = p->current_song_index - 1;
+                            }
+                        }
+                        if (prev_idx >= 0 && prev_idx < p->browser_count) {
+                            p->current_song_index = prev_idx;
+                            if (player_open_file(p->browser_files[prev_idx])) {
+                                update_prev_next_display(p);
+                                player_play();
+                                p->needs_redraw = 1;
+                            }
+                        }
+                    }
+                    break;
+                }
+                case 1:  /* Seek backward 5 sec */
+                    if (p->total_samples > 0) {
+                        player_seek(p->current_sample - p->sample_rate * 5);
+                    }
+                    break;
+                case 2:  /* Play/Pause */
+                    player_pause();
+                    break;
+                case 3:  /* Seek forward 5 sec */
+                    if (p->total_samples > 0) {
+                        player_seek(p->current_sample + p->sample_rate * 5);
+                    }
+                    break;
+                case 4: { /* Next track */
+                    int next_idx = get_next_song_index(p);
+                    if (next_idx >= 0 && next_idx < p->browser_count) {
+                        p->current_song_index = next_idx;
+                        if (player_open_file(p->browser_files[next_idx])) {
+                            update_prev_next_display(p);
+                            player_play();
+                            p->needs_redraw = 1;
+                        }
+                    }
+                    break;
+                }
+                case 5:  /* Toggle shuffle */
+                    p->shuffle_enabled = !p->shuffle_enabled;
+                    if (p->shuffle_enabled && p->current_song_index >= 0) {
+                        shuffle_files(p);
+                    }
+                    p->needs_redraw = 1;
+                    break;
+                case 6:  /* Cycle repeat mode */
+                    p->repeat_mode = (p->repeat_mode + 1) % 3;
+                    p->needs_redraw = 1;
+                    break;
+            }
         }
         if (pushed & kButtonB) {
             player_stop();
-        }
-        /* D-pad left/right → seek ±5 seconds (only for finite tracks) */
-        if (p->total_samples > 0) {
-            if (pushed & kButtonLeft) {
-                player_seek(p->current_sample - p->sample_rate * 5);
-            }
-            if (pushed & kButtonRight) {
-                player_seek(p->current_sample + p->sample_rate * 5);
-            }
         }
         break;
 
     case STATE_PAUSED:
+        /* D-pad left/right → cycle through button bar */
+        if (pushed & kButtonLeft) {
+            p->selected_button = (p->selected_button - 1 + 7) % 7;
+            p->needs_redraw = 1;
+        }
+        if (pushed & kButtonRight) {
+            p->selected_button = (p->selected_button + 1) % 7;
+            p->needs_redraw = 1;
+        }
+        /* A button → resume or activate button */
         if (pushed & kButtonA) {
-            player_play();
+            /* Use same button activation as STATE_PLAYING */
+            switch (p->selected_button) {
+                case 0: { /* Previous track */
+                    if (p->browser_count > 0 && p->current_song_index >= 0) {
+                        int prev_idx = -1;
+                        if (p->shuffle_enabled) {
+                            for (int i = 0; i < p->shuffled_count; i++) {
+                                if (p->shuffled_indices[i] == p->current_song_index && i > 0) {
+                                    prev_idx = p->shuffled_indices[i - 1];
+                                    break;
+                                }
+                            }
+                        } else {
+                            if (p->current_song_index > 0) {
+                                prev_idx = p->current_song_index - 1;
+                            }
+                        }
+                        if (prev_idx >= 0 && prev_idx < p->browser_count) {
+                            p->current_song_index = prev_idx;
+                            if (player_open_file(p->browser_files[prev_idx])) {
+                                update_prev_next_display(p);
+                                player_play();
+                                p->needs_redraw = 1;
+                            }
+                        }
+                    }
+                    break;
+                }
+                case 1:  /* Seek backward 5 sec */
+                    if (p->total_samples > 0) {
+                        player_seek(p->current_sample - p->sample_rate * 5);
+                    }
+                    break;
+                case 2:  /* Play/Resume */
+                    player_play();
+                    break;
+                case 3:  /* Seek forward 5 sec */
+                    if (p->total_samples > 0) {
+                        player_seek(p->current_sample + p->sample_rate * 5);
+                    }
+                    break;
+                case 4: { /* Next track */
+                    int next_idx = get_next_song_index(p);
+                    if (next_idx >= 0 && next_idx < p->browser_count) {
+                        p->current_song_index = next_idx;
+                        if (player_open_file(p->browser_files[next_idx])) {
+                            update_prev_next_display(p);
+                            player_play();
+                            p->needs_redraw = 1;
+                        }
+                    }
+                    break;
+                }
+                case 5:  /* Toggle shuffle */
+                    p->shuffle_enabled = !p->shuffle_enabled;
+                    if (p->shuffle_enabled && p->current_song_index >= 0) {
+                        shuffle_files(p);
+                    }
+                    p->needs_redraw = 1;
+                    break;
+                case 6:  /* Cycle repeat mode */
+                    p->repeat_mode = (p->repeat_mode + 1) % 3;
+                    p->needs_redraw = 1;
+                    break;
+            }
         }
         if (pushed & kButtonB) {
             player_stop();
-        }
-        if (p->total_samples > 0) {
-            if (pushed & kButtonLeft) {
-                player_seek(p->current_sample - p->sample_rate * 5);
-            }
-            if (pushed & kButtonRight) {
-                player_seek(p->current_sample + p->sample_rate * 5);
-            }
         }
         break;
 
@@ -1114,6 +1673,24 @@ static void menu_mono_toggle(void* userdata) {
                 if (pos > 0) player_seek(pos);
             }
         }
+    }
+    p->needs_redraw = 1;
+}
+
+static void menu_repeat_cycle(void* userdata) {
+    VGMPlayer* p = (VGMPlayer*)userdata;
+    p->repeat_mode = p->pd->system->getMenuItemValue(p->menu_repeat);
+    p->needs_redraw = 1;
+}
+
+static void menu_shuffle_toggle(void* userdata) {
+    VGMPlayer* p = (VGMPlayer*)userdata;
+    int shuffle_mode = p->pd->system->getMenuItemValue(p->menu_shuffle);
+    /* 0 = Off, 1 = Directory, 2 = All */
+    p->shuffle_enabled = (shuffle_mode > 0) ? 1 : 0;
+    p->shuffle_all = (shuffle_mode == 2) ? 1 : 0;
+    if (p->shuffle_enabled && p->current_song_index >= 0) {
+        shuffle_files(p);
     }
     p->needs_redraw = 1;
 }
