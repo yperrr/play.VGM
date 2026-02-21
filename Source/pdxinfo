@@ -2,5 +2,5 @@ name=play.VGM
 author=yperrr
 description=VGM player using the vgmstream library
 bundleID=fr.yperr.play.VGM
-version=1.0.6
-buildNumber=6
+version=1.2.0
+buildNumber=0

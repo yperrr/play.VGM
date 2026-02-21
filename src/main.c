@@ -106,7 +106,6 @@ typedef struct {
     int      sample_rate;
     int32_t  total_samples;
     int32_t  current_sample;
-    int      loop_count;
 
     /* Resampler state (fixed-point 16.16)
      * step = source_rate * 65536 / 44100; frac accumulates across callbacks */
@@ -118,6 +117,8 @@ typedef struct {
     int         browser_selection;
     int         browser_count;
     char        browser_files[BROWSER_MAX_FILES][MAX_PATH];
+    int         browser_is_dir[BROWSER_MAX_FILES]; /* 0=file, 1=subdir, 2=parent nav ("../") */
+    char        current_dir[MAX_PATH];              /* directory currently being browsed */
     char        current_file[MAX_PATH];
     int         current_song_index;  /* index in browser_files for current song */
     char        error_msg[128];
@@ -125,7 +126,6 @@ typedef struct {
     /* Playback modes */
     int         repeat_mode;    /* 0=off, 1=track, 2=all */
     int         shuffle_enabled; /* 0=off, 1=on */
-    int         shuffle_all;     /* 0=directory only, 1=all directories */
     int         shuffled_indices[BROWSER_MAX_FILES];
     int         shuffled_count;
 
@@ -204,9 +204,6 @@ static void browser_scan(const char* directory);
 static void browser_draw(void);
 static void player_draw(void);
 static void draw_button_bar(PlaydateAPI* pd, VGMPlayer* p);
-static int  check_button_click(VGMPlayer* p, int x, int y);
-static void draw_button_bar(PlaydateAPI* pd, VGMPlayer* p);
-static int  check_button_click(VGMPlayer* p, int x, int y);
 static void vis_fullscreen_draw(void);
 static void error_draw(void);
 
@@ -461,7 +458,6 @@ static int player_open_file(const char* path)
         p->sample_rate   = sid_player_sample_rate(p->sid);
         p->total_samples = sid_player_total_samples(p->sid);  /* 0 = infinite */
         p->current_sample = 0;
-        p->loop_count    = 0;
         /* Use the fast non-resampling path when source rate matches output */
         if (p->sample_rate != PLAYDATE_AUDIO_RATE) {
             p->resample_step = ((uint32_t)p->sample_rate << 16) / PLAYDATE_AUDIO_RATE;
@@ -505,7 +501,6 @@ static int player_open_file(const char* path)
         p->sample_rate   = mod_player_sample_rate(p->mod);
         p->total_samples = mod_player_total_samples(p->mod);
         p->current_sample = 0;
-        p->loop_count    = 0;
         p->resample_step = 0;  /* libxmp outputs at 44100 Hz, no resampling */
         p->resample_frac = 0;
 
@@ -566,7 +561,6 @@ static int player_open_file(const char* path)
     p->sample_rate   = fmt->sample_rate;
     p->total_samples = fmt->stream_samples;
     p->current_sample = 0;
-    p->loop_count    = 0;
 
     /* Set up resampler if source rate differs from Playdate's 44100 Hz */
     if (p->sample_rate != PLAYDATE_AUDIO_RATE) {
@@ -722,7 +716,43 @@ static void player_seek(int32_t sample)
 typedef struct {
     VGMPlayer*  player;
     const char* directory;
+    /* Pointer to caller-allocated pending_dirs buffer (avoids a large
+     * stack allocation — 64×256 bytes would overflow on Playdate). */
+    char (*pending_dirs)[MAX_PATH];
+    int  pending_dir_count;
 } BrowserScanCtx;
+
+static const char* const BROWSER_SUPPORTED_EXT[] = {
+    ".adx",  ".aix",  ".brstm", ".bcstm", ".bfstm",
+    ".dsp",  ".hca",  ".idsp",  ".vag",   ".vagp",
+    ".wem",  ".xwb",  ".fsb",   ".bnk",   ".acb",
+    ".awb",  ".txtp", ".str",   ".ss2",   ".ads",
+    ".mib",  ".sid",
+    ".mod",  ".xm",   ".it",   ".s3m",
+    NULL
+};
+
+/* Quick check: does a directory contain at least one supported audio file? */
+static void browser_check_audio_callback(const char* filename, void* userdata)
+{
+    int* found = (int*)userdata;
+    if (*found) return;
+    const char* ext = strrchr(filename, '.');
+    if (!ext) return;
+    for (int i = 0; BROWSER_SUPPORTED_EXT[i]; i++) {
+        if (strcasecmp(ext, BROWSER_SUPPORTED_EXT[i]) == 0) {
+            *found = 1;
+            return;
+        }
+    }
+}
+
+static int browser_dir_has_audio(PlaydateAPI* pd, const char* dir_path)
+{
+    int found = 0;
+    pd->file->listfiles(dir_path, browser_check_audio_callback, &found, 0);
+    return found;
+}
 
 static void browser_listfiles_callback(const char* filename, void* userdata)
 {
@@ -730,29 +760,30 @@ static void browser_listfiles_callback(const char* filename, void* userdata)
     VGMPlayer* pl = ctx->player;
     if (pl->browser_count >= BROWSER_MAX_FILES) return;
 
+    /* Playdate signals directories with a trailing slash on the filename.
+     * Use that to detect dirs — no stat() needed (stat inside a listfiles
+     * callback corrupts the SDK's directory iterator). */
+    int flen = (int)strlen(filename);
+    int is_dir = (flen > 0 && filename[flen - 1] == '/');
+
+    if (is_dir) {
+        /* Build clean path (no trailing slash) and defer audio check */
+        if (ctx->pending_dir_count < BROWSER_MAX_FILES) {
+            char* dst = ctx->pending_dirs[ctx->pending_dir_count++];
+            snprintf(dst, MAX_PATH, "%s/%.*s", ctx->directory, flen - 1, filename);
+        }
+        return;
+    }
+
     /* Accept files with known game audio extensions */
     const char* ext = strrchr(filename, '.');
     if (!ext) return;
 
-    /* vgmstream formats natively supported without external codec libraries,
-     * plus .sid for the built-in SID emulator.
-     * Excluded: .at3/.at9 (ATRAC, needs USE_ATRAC9/FFmpeg),
-     *           .ogg (Vorbis, needs USE_VORBIS),
-     *           .lopus (Opus, needs USE_VORBIS or system Opus). */
-    static const char* supported[] = {
-        ".adx",  ".aix",  ".brstm", ".bcstm", ".bfstm",
-        ".dsp",  ".hca",  ".idsp",  ".vag",   ".vagp",
-        ".wem",  ".xwb",  ".fsb",   ".bnk",   ".acb",
-        ".awb",  ".txtp", ".str",   ".ss2",   ".ads",
-        ".mib",  ".sid",
-        ".mod",  ".xm",   ".it",   ".s3m",
-        NULL
-    };
-
-    for (int i = 0; supported[i]; i++) {
-        if (strcasecmp(ext, supported[i]) == 0) {
+    for (int i = 0; BROWSER_SUPPORTED_EXT[i]; i++) {
+        if (strcasecmp(ext, BROWSER_SUPPORTED_EXT[i]) == 0) {
             snprintf(pl->browser_files[pl->browser_count],
                      MAX_PATH, "%s/%s", ctx->directory, filename);
+            pl->browser_is_dir[pl->browser_count] = 0;
             pl->browser_count++;
             return;
         }
@@ -762,18 +793,52 @@ static void browser_listfiles_callback(const char* filename, void* userdata)
 static void browser_scan(const char* directory)
 {
     VGMPlayer* p = &g_player;
+
+    /* Copy directory immediately — the caller may pass a pointer into
+     * p->browser_files[], which we overwrite below when adding "../". */
+    char dir[MAX_PATH];
+    snprintf(dir, sizeof(dir), "%s", directory);
+    directory = dir;
+
     p->browser_count = 0;
     p->browser_selection = 0;
+    strncpy(p->current_dir, directory, sizeof(p->current_dir) - 1);
+
+    /* Add "../" parent navigation entry if not at the root "vgm" directory */
+    if (strcmp(directory, "vgm") != 0) {
+        char parent_path[MAX_PATH];
+        strncpy(parent_path, directory, sizeof(parent_path) - 1);
+        char* last_slash = strrchr(parent_path, '/');
+        if (last_slash) {
+            *last_slash = '\0';
+        } else {
+            strncpy(parent_path, "vgm", sizeof(parent_path) - 1);
+        }
+        strncpy(p->browser_files[0], parent_path, MAX_PATH - 1);
+        p->browser_is_dir[0] = 2;  /* parent nav */
+        p->browser_count = 1;
+    }
 
     /*
      * Playdate filesystem API to list files.
-     * We look for common vgmstream-supported extensions.
+     * Directories are collected first; audio check happens after listfiles
+     * returns so we never make a nested (non-reentrant) listfiles call.
+     * pending_dirs is static to avoid a ~16 KB stack allocation.
      */
-    BrowserScanCtx ctx = { .player = p, .directory = directory };
+    static char pending_dirs[BROWSER_MAX_FILES][MAX_PATH];
+    BrowserScanCtx ctx = { .player = p, .directory = directory,
+                           .pending_dirs = pending_dirs, .pending_dir_count = 0 };
     p->pd->file->listfiles(directory, browser_listfiles_callback, (void*)&ctx, 0);
 
-    p->pd->system->logToConsole("VGM: found %d files in %s",
-                                 p->browser_count, directory);
+    /* Now check each candidate directory for audio content */
+    for (int i = 0; i < ctx.pending_dir_count && p->browser_count < BROWSER_MAX_FILES; i++) {
+        if (browser_dir_has_audio(p->pd, ctx.pending_dirs[i])) {
+            snprintf(p->browser_files[p->browser_count], MAX_PATH, "%s", ctx.pending_dirs[i]);
+            p->browser_is_dir[p->browser_count] = 1;
+            p->browser_count++;
+        }
+    }
+
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -819,10 +884,23 @@ static void browser_draw(void)
             pd->graphics->setDrawMode(kDrawModeInverted);
         }
 
-        /* Show just the filename, not full path */
-        const char* name = strrchr(p->browser_files[i], '/');
-        name = name ? name + 1 : p->browser_files[i];
-        pd->graphics->drawText(name, strlen(name),
+        char display_name[MAX_PATH + 2];
+        if (p->browser_is_dir[i] == 2) {
+            /* Parent navigation entry */
+            strncpy(display_name, "../", sizeof(display_name) - 1);
+        } else if (p->browser_is_dir[i] == 1) {
+            /* Subdirectory: show just the dirname with trailing slash */
+            const char* dname = strrchr(p->browser_files[i], '/');
+            dname = dname ? dname + 1 : p->browser_files[i];
+            snprintf(display_name, sizeof(display_name), "%s/", dname);
+        } else {
+            /* Regular file: show just the filename */
+            const char* fname = strrchr(p->browser_files[i], '/');
+            fname = fname ? fname + 1 : p->browser_files[i];
+            strncpy(display_name, fname, sizeof(display_name) - 1);
+        }
+
+        pd->graphics->drawText(display_name, strlen(display_name),
                                kASCIIEncoding, 12, y);
 
         if (i == p->browser_selection) {
@@ -1261,16 +1339,6 @@ static void draw_button_bar(PlaydateAPI* pd, VGMPlayer* p) {
 
 }
 
-static int check_button_click(VGMPlayer* p, int x, int y) {
-    for (int i = 0; i < 7; i++) {
-        if (x >= p->buttons[i].x && x < p->buttons[i].x + p->buttons[i].w &&
-            y >= p->buttons[i].y && y < p->buttons[i].y + p->buttons[i].h) {
-            return i;
-        }
-    }
-    return -1;
-}
-
 static void vis_fullscreen_draw(void)
 {
     VGMPlayer* p = &g_player;
@@ -1324,12 +1392,14 @@ static void vis_fullscreen_draw(void)
  * ══════════════════════════════════════════════════════════════════════ */
 
 static void shuffle_files(VGMPlayer* p) {
-    p->shuffled_count = p->browser_count;
+    /* Only include actual audio files (not "../" or subdirectory entries) */
+    p->shuffled_count = 0;
     for (int i = 0; i < p->browser_count; i++) {
-        p->shuffled_indices[i] = i;
+        if (p->browser_is_dir[i] == 0)
+            p->shuffled_indices[p->shuffled_count++] = i;
     }
     /* Fisher-Yates shuffle using rand() for randomness */
-    for (int i = p->browser_count - 1; i > 0; i--) {
+    for (int i = p->shuffled_count - 1; i > 0; i--) {
         int j = rand() % (i + 1);
         int tmp = p->shuffled_indices[i];
         p->shuffled_indices[i] = p->shuffled_indices[j];
@@ -1339,10 +1409,15 @@ static void shuffle_files(VGMPlayer* p) {
 
 static int get_next_song_index(VGMPlayer* p) {
     if (p->browser_count == 0) return -1;
-    if (p->current_song_index < 0) return 0;
-    
+    if (p->current_song_index < 0) {
+        /* Find first playable file (skip any leading dir entries) */
+        for (int i = 0; i < p->browser_count; i++)
+            if (p->browser_is_dir[i] == 0) return i;
+        return -1;
+    }
+
     int next_idx = -1;
-    
+
     if (p->shuffle_enabled) {
         /* Find current song in shuffled list */
         int pos = -1;
@@ -1360,15 +1435,75 @@ static int get_next_song_index(VGMPlayer* p) {
             next_idx = (p->shuffled_count > 0) ? p->shuffled_indices[0] : -1;
         }
     } else {
-        if (p->current_song_index < p->browser_count - 1) {
-            next_idx = p->current_song_index + 1;
-        } else if (p->repeat_mode == 2) {
-            /* Repeat all: go to first song */
-            next_idx = 0;
+        /* Step forward, skipping directory entries */
+        next_idx = p->current_song_index + 1;
+        while (next_idx < p->browser_count && p->browser_is_dir[next_idx] != 0)
+            next_idx++;
+        if (next_idx >= p->browser_count) {
+            if (p->repeat_mode == 2) {
+                /* Repeat all: wrap to first playable file */
+                next_idx = 0;
+                while (next_idx < p->browser_count && p->browser_is_dir[next_idx] != 0)
+                    next_idx++;
+                if (next_idx >= p->browser_count) next_idx = -1;
+            } else {
+                next_idx = -1;
+            }
         }
     }
-    
+
     return next_idx;
+}
+
+/* Read the embedded title for a file (SID: title/author, MOD/XM/IT/S3M: module
+ * name). Falls back to the bare filename when no embedded title is found. */
+static void title_for_file(const char* path, char* buf, int buf_size)
+{
+    VGMPlayer* p = &g_player;
+    const char* ext = strrchr(path, '.');
+    buf[0] = '\0';
+
+    if (ext && strcasecmp(ext, ".sid") == 0) {
+        /* Read title/author directly from the PSID/RSID header (fixed offsets)
+         * WITHOUT initialising the cRSID C64 emulator — cRSID_init() returns a
+         * pointer to a global C64 instance, so calling sid_player_open() here
+         * would overwrite the emulator state of the currently-playing SID. */
+        SDFile* f = p->pd->file->open(path, kFileRead | kFileReadData);
+        if (f) {
+            /* PSID/RSID header layout:
+             *   0x00  magic ("PSID"/"RSID")  4 bytes
+             *   0x16  title                  32 bytes (may not be NUL-terminated)
+             *   0x36  author                 32 bytes */
+            unsigned char hdr[0x56];
+            if (p->pd->file->read(f, hdr, sizeof(hdr)) == (int)sizeof(hdr)) {
+                char title[33];
+                memcpy(title, hdr + 0x16, 32); title[32] = '\0';
+                if (title[0] != '\0')
+                    strncpy(buf, title, buf_size - 1);
+            }
+            p->pd->file->close(f);
+        }
+    } else if (ext && (strcasecmp(ext, ".mod") == 0 ||
+                       strcasecmp(ext, ".xm")  == 0 ||
+                       strcasecmp(ext, ".it")  == 0 ||
+                       strcasecmp(ext, ".s3m") == 0)) {
+        ModPlayer* mp = mod_player_open(p->pd, path, /*force_mono=*/0);
+        if (mp) {
+            const char* title = mod_player_title(mp);
+            if (title[0] != '\0')
+                strncpy(buf, title, buf_size - 1);
+            mod_player_close(mp);
+        }
+    }
+    /* VGM/other formats: no cheap metadata access — fall through to filename */
+
+    /* Fallback to bare filename */
+    if (buf[0] == '\0') {
+        const char* name = strrchr(path, '/');
+        name = name ? name + 1 : path;
+        strncpy(buf, name, buf_size - 1);
+        buf[buf_size - 1] = '\0';
+    }
 }
 
 static void update_prev_next_display(VGMPlayer* p) {
@@ -1382,32 +1517,26 @@ static void update_prev_next_display(VGMPlayer* p) {
             }
         }
     } else {
-        if (p->current_song_index > 0) {
-            prev_idx = p->current_song_index - 1;
-        }
+        int prev_cand = p->current_song_index - 1;
+        while (prev_cand >= 0 && p->browser_is_dir[prev_cand] != 0)
+            prev_cand--;
+        if (prev_cand >= 0)
+            prev_idx = prev_cand;
     }
 
     /* Get next song index */
     int next_idx = get_next_song_index(p);
 
-    /* Extract file names for previous song */
     if (prev_idx >= 0 && prev_idx < p->browser_count) {
-        const char* name = strrchr(p->browser_files[prev_idx], '/');
-        name = name ? name + 1 : p->browser_files[prev_idx];
-        strncpy(p->prev_title, name, sizeof(p->prev_title) - 1);
-        p->prev_title[sizeof(p->prev_title) - 1] = '\0';
+        title_for_file(p->browser_files[prev_idx], p->prev_title, sizeof(p->prev_title));
         p->prev_scroll_x = 0;
         p->prev_scroll_wait = 60;
     } else {
         p->prev_title[0] = '\0';
     }
 
-    /* Extract file names for next song */
     if (next_idx >= 0 && next_idx < p->browser_count) {
-        const char* name = strrchr(p->browser_files[next_idx], '/');
-        name = name ? name + 1 : p->browser_files[next_idx];
-        strncpy(p->next_title, name, sizeof(p->next_title) - 1);
-        p->next_title[sizeof(p->next_title) - 1] = '\0';
+        title_for_file(p->browser_files[next_idx], p->next_title, sizeof(p->next_title));
         p->next_scroll_x = 0;
         p->next_scroll_wait = 60;
     } else {
@@ -1436,13 +1565,95 @@ static void error_draw(void)
  * INPUT HANDLING
  * ══════════════════════════════════════════════════════════════════════ */
 
+/* Shared button handler for STATE_PLAYING and STATE_PAUSED */
+static void handle_playback_input(VGMPlayer* p, PDButtons pushed)
+{
+    /* D-pad left/right → cycle through button bar */
+    if (pushed & kButtonLeft) {
+        p->selected_button = (p->selected_button - 1 + 7) % 7;
+        p->needs_redraw = 1;
+    }
+    if (pushed & kButtonRight) {
+        p->selected_button = (p->selected_button + 1) % 7;
+        p->needs_redraw = 1;
+    }
+    if (pushed & kButtonA) {
+        switch (p->selected_button) {
+            case 0: { /* Previous track */
+                if (p->browser_count > 0 && p->current_song_index >= 0) {
+                    int prev_idx = -1;
+                    if (p->shuffle_enabled) {
+                        for (int i = 0; i < p->shuffled_count; i++) {
+                            if (p->shuffled_indices[i] == p->current_song_index && i > 0) {
+                                prev_idx = p->shuffled_indices[i - 1];
+                                break;
+                            }
+                        }
+                    } else {
+                        int prev_cand = p->current_song_index - 1;
+                        while (prev_cand >= 0 && p->browser_is_dir[prev_cand] != 0)
+                            prev_cand--;
+                        if (prev_cand >= 0)
+                            prev_idx = prev_cand;
+                    }
+                    if (prev_idx >= 0 && prev_idx < p->browser_count) {
+                        p->current_song_index = prev_idx;
+                        if (player_open_file(p->browser_files[prev_idx])) {
+                            update_prev_next_display(p);
+                            player_play();
+                            p->needs_redraw = 1;
+                        }
+                    }
+                }
+                break;
+            }
+            case 1:  /* Seek backward 5 sec */
+                if (p->total_samples > 0)
+                    player_seek(p->current_sample - p->sample_rate * 5);
+                break;
+            case 2:  /* Play/Pause toggle */
+                if (p->state == STATE_PAUSED) player_play();
+                else player_pause();
+                break;
+            case 3:  /* Seek forward 5 sec */
+                if (p->total_samples > 0)
+                    player_seek(p->current_sample + p->sample_rate * 5);
+                break;
+            case 4: { /* Next track */
+                int next_idx = get_next_song_index(p);
+                if (next_idx >= 0 && next_idx < p->browser_count) {
+                    p->current_song_index = next_idx;
+                    if (player_open_file(p->browser_files[next_idx])) {
+                        update_prev_next_display(p);
+                        player_play();
+                        p->needs_redraw = 1;
+                    }
+                }
+                break;
+            }
+            case 5:  /* Toggle shuffle */
+                p->shuffle_enabled = !p->shuffle_enabled;
+                if (p->shuffle_enabled && p->current_song_index >= 0)
+                    shuffle_files(p);
+                p->needs_redraw = 1;
+                break;
+            case 6:  /* Cycle repeat mode */
+                p->repeat_mode = (p->repeat_mode + 1) % 3;
+                p->needs_redraw = 1;
+                break;
+        }
+    }
+    if (pushed & kButtonB)
+        player_stop();
+}
+
 static void handle_input(void)
 {
     VGMPlayer* p = &g_player;
     PlaydateAPI* pd = p->pd;
 
-    PDButtons pushed, current;
-    pd->system->getButtonState(&current, &pushed, NULL);
+    PDButtons pushed;
+    pd->system->getButtonState(NULL, &pushed, NULL);
 
     switch (p->state) {
     case STATE_BROWSER:
@@ -1457,181 +1668,45 @@ static void handle_input(void)
         }
         if (pushed & kButtonA) {
             if (p->browser_count > 0) {
-                p->current_song_index = p->browser_selection;
-                if (p->shuffle_enabled) {
-                    shuffle_files(p);
+                int sel = p->browser_selection;
+                if (p->browser_is_dir[sel] != 0) {
+                    /* Navigate into subdir or up to parent */
+                    int was_subdir = (p->browser_is_dir[sel] == 1);
+                    browser_scan(p->browser_files[sel]);
+                    /* When entering a subdir (not going up), skip the "../"
+                     * entry so the cursor lands on the first real file. */
+                    if (was_subdir && p->browser_count > 1)
+                        p->browser_selection = 1;
+                    p->needs_redraw = 1;
+                } else {
+                    /* Play the selected file */
+                    p->current_song_index = sel;
+                    if (p->shuffle_enabled)
+                        shuffle_files(p);
+                    if (player_open_file(p->browser_files[sel])) {
+                        update_prev_next_display(p);
+                        player_play();
+                    }
                 }
-                if (player_open_file(p->browser_files[p->browser_selection])) {
-                    update_prev_next_display(p);
-                    player_play();
-                }
+            }
+        }
+        if (pushed & kButtonB) {
+            /* Go up one directory level */
+            if (strcmp(p->current_dir, "vgm") != 0) {
+                char parent_path[MAX_PATH];
+                strncpy(parent_path, p->current_dir, sizeof(parent_path) - 1);
+                char* last_slash = strrchr(parent_path, '/');
+                if (last_slash) *last_slash = '\0';
+                else strncpy(parent_path, "vgm", sizeof(parent_path) - 1);
+                browser_scan(parent_path);
+                p->needs_redraw = 1;
             }
         }
         break;
 
     case STATE_PLAYING:
-        /* D-pad left/right → cycle through button bar */
-        if (pushed & kButtonLeft) {
-            p->selected_button = (p->selected_button - 1 + 7) % 7;
-            p->needs_redraw = 1;
-        }
-        if (pushed & kButtonRight) {
-            p->selected_button = (p->selected_button + 1) % 7;
-            p->needs_redraw = 1;
-        }
-        /* A button → activate selected button */
-        if (pushed & kButtonA) {
-            switch (p->selected_button) {
-                case 0: { /* Previous track */
-                    if (p->browser_count > 0 && p->current_song_index >= 0) {
-                        int prev_idx = -1;
-                        if (p->shuffle_enabled) {
-                            for (int i = 0; i < p->shuffled_count; i++) {
-                                if (p->shuffled_indices[i] == p->current_song_index && i > 0) {
-                                    prev_idx = p->shuffled_indices[i - 1];
-                                    break;
-                                }
-                            }
-                        } else {
-                            if (p->current_song_index > 0) {
-                                prev_idx = p->current_song_index - 1;
-                            }
-                        }
-                        if (prev_idx >= 0 && prev_idx < p->browser_count) {
-                            p->current_song_index = prev_idx;
-                            if (player_open_file(p->browser_files[prev_idx])) {
-                                update_prev_next_display(p);
-                                player_play();
-                                p->needs_redraw = 1;
-                            }
-                        }
-                    }
-                    break;
-                }
-                case 1:  /* Seek backward 5 sec */
-                    if (p->total_samples > 0) {
-                        player_seek(p->current_sample - p->sample_rate * 5);
-                    }
-                    break;
-                case 2:  /* Play/Pause */
-                    player_pause();
-                    break;
-                case 3:  /* Seek forward 5 sec */
-                    if (p->total_samples > 0) {
-                        player_seek(p->current_sample + p->sample_rate * 5);
-                    }
-                    break;
-                case 4: { /* Next track */
-                    int next_idx = get_next_song_index(p);
-                    if (next_idx >= 0 && next_idx < p->browser_count) {
-                        p->current_song_index = next_idx;
-                        if (player_open_file(p->browser_files[next_idx])) {
-                            update_prev_next_display(p);
-                            player_play();
-                            p->needs_redraw = 1;
-                        }
-                    }
-                    break;
-                }
-                case 5:  /* Toggle shuffle */
-                    p->shuffle_enabled = !p->shuffle_enabled;
-                    if (p->shuffle_enabled && p->current_song_index >= 0) {
-                        shuffle_files(p);
-                    }
-                    p->needs_redraw = 1;
-                    break;
-                case 6:  /* Cycle repeat mode */
-                    p->repeat_mode = (p->repeat_mode + 1) % 3;
-                    p->needs_redraw = 1;
-                    break;
-            }
-        }
-        if (pushed & kButtonB) {
-            player_stop();
-        }
-        break;
-
     case STATE_PAUSED:
-        /* D-pad left/right → cycle through button bar */
-        if (pushed & kButtonLeft) {
-            p->selected_button = (p->selected_button - 1 + 7) % 7;
-            p->needs_redraw = 1;
-        }
-        if (pushed & kButtonRight) {
-            p->selected_button = (p->selected_button + 1) % 7;
-            p->needs_redraw = 1;
-        }
-        /* A button → resume or activate button */
-        if (pushed & kButtonA) {
-            /* Use same button activation as STATE_PLAYING */
-            switch (p->selected_button) {
-                case 0: { /* Previous track */
-                    if (p->browser_count > 0 && p->current_song_index >= 0) {
-                        int prev_idx = -1;
-                        if (p->shuffle_enabled) {
-                            for (int i = 0; i < p->shuffled_count; i++) {
-                                if (p->shuffled_indices[i] == p->current_song_index && i > 0) {
-                                    prev_idx = p->shuffled_indices[i - 1];
-                                    break;
-                                }
-                            }
-                        } else {
-                            if (p->current_song_index > 0) {
-                                prev_idx = p->current_song_index - 1;
-                            }
-                        }
-                        if (prev_idx >= 0 && prev_idx < p->browser_count) {
-                            p->current_song_index = prev_idx;
-                            if (player_open_file(p->browser_files[prev_idx])) {
-                                update_prev_next_display(p);
-                                player_play();
-                                p->needs_redraw = 1;
-                            }
-                        }
-                    }
-                    break;
-                }
-                case 1:  /* Seek backward 5 sec */
-                    if (p->total_samples > 0) {
-                        player_seek(p->current_sample - p->sample_rate * 5);
-                    }
-                    break;
-                case 2:  /* Play/Resume */
-                    player_play();
-                    break;
-                case 3:  /* Seek forward 5 sec */
-                    if (p->total_samples > 0) {
-                        player_seek(p->current_sample + p->sample_rate * 5);
-                    }
-                    break;
-                case 4: { /* Next track */
-                    int next_idx = get_next_song_index(p);
-                    if (next_idx >= 0 && next_idx < p->browser_count) {
-                        p->current_song_index = next_idx;
-                        if (player_open_file(p->browser_files[next_idx])) {
-                            update_prev_next_display(p);
-                            player_play();
-                            p->needs_redraw = 1;
-                        }
-                    }
-                    break;
-                }
-                case 5:  /* Toggle shuffle */
-                    p->shuffle_enabled = !p->shuffle_enabled;
-                    if (p->shuffle_enabled && p->current_song_index >= 0) {
-                        shuffle_files(p);
-                    }
-                    p->needs_redraw = 1;
-                    break;
-                case 6:  /* Cycle repeat mode */
-                    p->repeat_mode = (p->repeat_mode + 1) % 3;
-                    p->needs_redraw = 1;
-                    break;
-            }
-        }
-        if (pushed & kButtonB) {
-            player_stop();
-        }
+        handle_playback_input(p, pushed);
         break;
 
     case STATE_ERROR:
@@ -1699,7 +1774,6 @@ static void menu_shuffle_toggle(void* userdata) {
     int shuffle_mode = p->pd->system->getMenuItemValue(p->menu_shuffle);
     /* 0 = Off, 1 = Directory, 2 = All */
     p->shuffle_enabled = (shuffle_mode > 0) ? 1 : 0;
-    p->shuffle_all = (shuffle_mode == 2) ? 1 : 0;
     if (p->shuffle_enabled && p->current_song_index >= 0) {
         shuffle_files(p);
     }
@@ -1726,6 +1800,7 @@ static void player_init(PlaydateAPI* pd)
 
 static int update(void* userdata)
 {
+    (void)userdata;
     VGMPlayer* p = &g_player;
 
     handle_input();
