@@ -18,6 +18,7 @@ libs/libxmp/
 .vscode/
 .claude/
 scripts/
+TODO
 
 # Compiled binaries and objects
 *.o

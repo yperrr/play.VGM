@@ -1568,6 +1568,21 @@ static void error_draw(void)
 /* Shared button handler for STATE_PLAYING and STATE_PAUSED */
 static void handle_playback_input(VGMPlayer* p, PDButtons pushed)
 {
+    /* Fullscreen visualizer: A = play/pause, left/right = seek */
+    if (p->vis_enabled && p->vis_fullscreen) {
+        if (pushed & kButtonA) {
+            if (p->state == STATE_PAUSED) player_play();
+            else player_pause();
+        }
+        if (pushed & kButtonLeft) {
+            player_seek(p->current_sample - (int32_t)(p->sample_rate * 5));
+        }
+        if (pushed & kButtonRight) {
+            player_seek(p->current_sample + (int32_t)(p->sample_rate * 5));
+        }
+        return;
+    }
+
     /* D-pad left/right → cycle through button bar */
     if (pushed & kButtonLeft) {
         p->selected_button = (p->selected_button - 1 + 7) % 7;
@@ -1735,6 +1750,9 @@ static void menu_vis_fullscreen(void* userdata) {
     VGMPlayer* p = (VGMPlayer*)userdata;
     PDMenuItem* item = (PDMenuItem*)p->menu_vis_fs;
     p->vis_fullscreen = p->pd->system->getMenuItemValue(item);
+    /* Restore focus to play/pause button when leaving fullscreen */
+    if (!p->vis_fullscreen)
+        p->selected_button = 2;
     p->needs_redraw = 1;
 }
 
