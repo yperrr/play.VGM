@@ -12,6 +12,7 @@ target/
 libs/vgmstream/
 libs/crsid/
 libs/libxmp/
+libs/snes_spc/
 
 # IDE / editor config
 .idea/

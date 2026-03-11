@@ -33,7 +33,7 @@ set(CMAKE_XCODE_GENERATE_SCHEME TRUE)
 set(PLAYDATE_GAME_NAME play.VGM)
 set(PLAYDATE_GAME_DEVICE play.VGM)
 
-project(${PLAYDATE_GAME_NAME} C ASM)
+project(${PLAYDATE_GAME_NAME} C CXX ASM)
 
 # ── Directory shortcuts ───────────────────────────────────────────────
 set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -45,6 +45,7 @@ set(LIBS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/libs)
 # which the Cortex-M7 cannot execute (UNDEFINSTR hard fault).
 if(TOOLCHAIN STREQUAL "armgcc")
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mthumb -mcpu=cortex-m7 -mfloat-abi=hard -mfpu=fpv5-sp-d16 -D__FPU_USED=1")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mthumb -mcpu=cortex-m7 -mfloat-abi=hard -mfpu=fpv5-sp-d16 -D__FPU_USED=1")
 endif()
 
 # ── vgmstream config ───────────────────────────────────────────────
@@ -123,12 +124,50 @@ else()
     set(MOD_LIBS "")
 endif()
 
+# ── SPC playback: blargg's snes_spc (SNES SPC700 + fast DSP) ─────────
+#
+# snes_spc is a well-tested SPC700 CPU + S-DSP emulator by blargg.
+# It is C++ internally but exposes a clean C API via spc.h.
+# We use the fast DSP variant (~3x faster than accurate) for Playdate.
+#
+# To enable SPC playback, clone snes_spc into libs/snes_spc/:
+#   git clone https://github.com/blarggs-audio-libraries/snes_spc.git libs/snes_spc
+#
+set(SNES_SPC_DIR ${LIBS_DIR}/snes_spc/snes_spc)
+if(EXISTS ${SNES_SPC_DIR}/spc.cpp)
+    add_library(snes_spc STATIC
+        ${SNES_SPC_DIR}/SNES_SPC.cpp
+        ${SNES_SPC_DIR}/SNES_SPC_misc.cpp
+        ${SNES_SPC_DIR}/SNES_SPC_state.cpp
+        ${SNES_SPC_DIR}/SPC_DSP.cpp
+        ${SNES_SPC_DIR}/SPC_Filter.cpp
+        ${SNES_SPC_DIR}/spc.cpp
+    )
+    target_include_directories(snes_spc PUBLIC ${SNES_SPC_DIR})
+    # Minimal C++ for baremetal: no exceptions, no RTTI, no threadsafe statics
+    target_compile_options(snes_spc PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions -fno-rtti -fno-threadsafe-statics>
+    )
+    set(SPC_SOURCES src/spc_player.c)
+    set(SPC_INCDIRS ${SNES_SPC_DIR})
+    set(SPC_LIBS snes_spc)
+else()
+    message(WARNING
+        "snes_spc not found — SPC playback disabled.\n"
+        "To enable it, run:\n"
+        "  git clone https://github.com/blarggs-audio-libraries/snes_spc.git libs/snes_spc")
+    set(SPC_SOURCES "")
+    set(SPC_INCDIRS "")
+    set(SPC_LIBS "")
+endif()
+
 # ── Game sources ─────────────────────────────────────────────────────
 set(GAME_SRC
     src/main.c
     src/vgm_pd_streamfile.c
     ${SID_SOURCES}
     ${MOD_SOURCES}
+    ${SPC_SOURCES}
 )
 
 # ── Create targets BEFORE including playdate_game.cmake ─────────────
@@ -144,6 +183,7 @@ if (TOOLCHAIN STREQUAL "armgcc")
         ${LIBS_DIR}/vgmstream/src/base
         ${SID_INCDIRS}
         ${MOD_INCDIRS}
+        ${SPC_INCDIRS}
     )
     target_compile_definitions(${PLAYDATE_GAME_DEVICE} PRIVATE
         GAME_NAME="${PLAYDATE_GAME_NAME}"
@@ -154,6 +194,9 @@ if (TOOLCHAIN STREQUAL "armgcc")
     endif()
     if(MOD_LIBS)
         list(APPEND _dev_libs ${MOD_LIBS})
+    endif()
+    if(SPC_LIBS)
+        list(APPEND _dev_libs ${SPC_LIBS})
     endif()
     if(_dev_libs)
         target_link_libraries(${PLAYDATE_GAME_DEVICE} PRIVATE ${_dev_libs})
@@ -168,6 +211,7 @@ else()
         ${LIBS_DIR}/vgmstream/src/base
         ${SID_INCDIRS}
         ${MOD_INCDIRS}
+        ${SPC_INCDIRS}
     )
     target_compile_definitions(${PLAYDATE_GAME_NAME} PRIVATE
         GAME_NAME="${PLAYDATE_GAME_NAME}"
@@ -181,6 +225,9 @@ else()
     endif()
     if(MOD_LIBS)
         list(APPEND _libs ${MOD_LIBS})
+    endif()
+    if(SPC_LIBS)
+        list(APPEND _libs ${SPC_LIBS})
     endif()
     if(_libs)
         target_link_libraries(${PLAYDATE_GAME_NAME} PRIVATE ${_libs})
@@ -208,6 +255,9 @@ if(TOOLCHAIN STREQUAL "armgcc")
     endif()
     if(TARGET xmp_lite_static)
         target_compile_options(xmp_lite_static PRIVATE -O3)
+    endif()
+    if(TARGET snes_spc)
+        target_compile_options(snes_spc PRIVATE -O3)
     endif()
 endif()
 

@@ -67,6 +67,9 @@ const char* mod_player_title(ModPlayer* mp);
  */
 void mod_player_seek(ModPlayer* mp, int32_t sample);
 
+/** Returns the last error reason from a failed mod_player_open() call. */
+const char* mod_player_last_error(void);
+
 #ifdef __cplusplus
 }
 #endif

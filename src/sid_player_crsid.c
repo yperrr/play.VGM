@@ -28,10 +28,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* 2 seconds of silence at 22050 Hz → subtune is finished */
+#define SID_SILENCE_THRESHOLD 10
+#define SID_SILENCE_SAMPLES  (22050 * 2)
+
 struct SidPlayer {
     PlaydateAPI*        pd;
     cRSID_C64instance*  c64;
     unsigned char*      filedata;  /* must outlive playback — C64->SIDheader points into it */
+    int                 silence_count;  /* consecutive near-silent samples */
+    int                 has_played;     /* 1 once non-silent audio detected */
     char                title[33];
     char                author[33];
 };
@@ -78,9 +84,11 @@ SidPlayer* sid_player_open(PlaydateAPI* pd, const char* path)
     SidPlayer* sp = (SidPlayer*)malloc(sizeof(SidPlayer));
     if (!sp) { free(filedata); return NULL; }
 
-    sp->pd       = pd;
-    sp->c64      = c64;
-    sp->filedata = filedata;
+    sp->pd             = pd;
+    sp->c64            = c64;
+    sp->filedata       = filedata;
+    sp->silence_count  = 0;
+    sp->has_played     = 0;
 
     /* Title and Author are 32-char arrays in the PSID header; they are
      * NOT NUL-terminated in the spec, so we copy and add the terminator. */
@@ -102,7 +110,17 @@ int sid_player_fill(SidPlayer* sp, int16_t* buf, int n_samples)
     /* SID hardware is mono — output mono samples directly.
      * main.c's audio callback duplicates mono to both L/R channels. */
     for (int i = 0; i < n_samples; i++) {
-        buf[i] = cRSID_generateSample(sp->c64);
+        int16_t s = cRSID_generateSample(sp->c64);
+        buf[i] = s;
+        /* Track consecutive near-silent samples for auto-skip.
+         * Only count silence after audio has actually played. */
+        if (s > -SID_SILENCE_THRESHOLD && s < SID_SILENCE_THRESHOLD) {
+            if (sp->has_played)
+                sp->silence_count++;
+        } else {
+            sp->has_played = 1;
+            sp->silence_count = 0;
+        }
     }
     return n_samples;
 }
@@ -112,3 +130,25 @@ int         sid_player_sample_rate (SidPlayer* sp) { (void)sp; return 22050; }
 int32_t     sid_player_total_samples(SidPlayer* sp){ (void)sp; return 0;     }
 const char* sid_player_title       (SidPlayer* sp) { return sp->title;       }
 const char* sid_player_author      (SidPlayer* sp) { return sp->author;      }
+
+int sid_player_is_silent(SidPlayer* sp)
+{
+    return sp->silence_count >= SID_SILENCE_SAMPLES;
+}
+
+int sid_player_subtune_count(SidPlayer* sp)
+{
+    unsigned char count = sp->c64->SIDheader->SubtuneAmount;
+    return (count == 0) ? 1 : (int)count;
+}
+
+int sid_player_set_subtune(SidPlayer* sp, int n)
+{
+    int count = sid_player_subtune_count(sp);
+    if (n < 1) n = 1;
+    if (n > count) n = count;
+    cRSID_initSIDtune(sp->c64, sp->c64->SIDheader, (char)n);
+    sp->silence_count = 0;
+    sp->has_played    = 0;
+    return n;
+}

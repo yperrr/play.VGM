@@ -41,6 +41,7 @@
 #include "libvgmstream.h"
 #include "sid_player.h"
 #include "mod_player.h"
+#include "spc_player.h"
 
 /* Playdate filesystem adapter for vgmstream (see vgm_pd_streamfile.c) */
 extern void             vgm_pd_streamfile_set_api(PlaydateAPI* pd);
@@ -53,12 +54,13 @@ extern libstreamfile_t* vgm_pd_open_streamfile(const char* path);
 #endif
 
 #define PLAYDATE_AUDIO_RATE    44100
-#define RING_BUF_SAMPLES       16384    /* ring buffer capacity (samples) */
-#define DECODE_CHUNK           512      /* samples per decode call        */
+#define RING_BUF_SAMPLES       32768    /* ring buffer capacity (samples) */
+#define DECODE_CHUNK           256      /* samples per decode call        */
 #define VIS_SAMPLES            360      /* one sample per oscilloscope pixel */
 #define MAX_PATH               256
 #define BROWSER_MAX_FILES      64
 #define FONT_HEIGHT            16
+#define HOLD_FRAMES_THRESHOLD  50      /* 1 second at 50 fps for long-press */
 
 /* ── Player state ───────────────────────────────────────────────────── */
 
@@ -83,6 +85,9 @@ typedef struct {
     /* Tracker module decoder context (NULL when not playing a tracker file) */
     ModPlayer* mod;
 
+    /* SPC decoder context (NULL when not playing an SPC file) */
+    SpcPlayer* spc;
+
     /* Track title from metadata (SID header) */
     char track_title[128];
 
@@ -101,7 +106,7 @@ typedef struct {
     int      stream_ended;     /* 1 when decoder has no more data       */
 
     /* Playback info */
-    int      channels;         /* output channels (1 if force_mono) */
+    int      channels;         /* output channels (native)           */
     int      source_channels;  /* file's native channel count       */
     int      sample_rate;
     int32_t  total_samples;
@@ -129,6 +134,17 @@ typedef struct {
     int         shuffled_indices[BROWSER_MAX_FILES];
     int         shuffled_count;
 
+    /* Subtrack navigation */
+    int         subtrack_count;      /* 0 = no subtracks, N = total */
+    int         subtrack_index;      /* 1-based current subtrack    */
+    int         btn_prev_hold_frames;
+    int         btn_next_hold_frames;
+    int         btn_long_fired;      /* 1 if long-press already fired this hold */
+
+    /* Button animations */
+    int         btn_blink_timer;     /* frames remaining for blink effect */
+    int         btn_blink_which;     /* which button is blinking (0-6)    */
+
     /* Previous/next song display with scrolling */
     char        prev_title[128];
     int         prev_scroll_x;
@@ -153,6 +169,11 @@ typedef struct {
     } buttons[7];  /* 0=prev, 1=seek_back, 2=play_pause, 3=seek_fwd, 4=next, 5=shuffle, 6=repeat */
     int selected_button;  /* 0-6 = currently selected button */
 
+    /* Crank seek state */
+    int      crank_docked;          /* last known dock state (1=docked) */
+    int      crank_paused;          /* 1 if we paused playback for crank seek */
+    float    crank_accum;           /* accumulated crank degrees for 1s steps */
+
     /* System menu items */
     PDMenuItem* menu_vis_toggle;
     PDMenuItem* menu_vis_fs;
@@ -162,7 +183,7 @@ typedef struct {
     int      menu_items_created;  /* 1 = menu items are currently visible, 0 = hidden */
 
     /* Audio mode */
-    int      force_mono;     /* 1 = mono output (default, better perf), 0 = stereo */
+    int      force_mono;     /* 1 = mono output (menu toggle), 0 = stereo */
 
     /* Dirty flag for display refresh */
     int      needs_redraw;
@@ -179,6 +200,7 @@ static void player_play(void);
 static void player_pause(void);
 static void player_stop(void);
 static void player_seek(int32_t sample);
+static void player_switch_subtrack(int n);
 
 /* Menu callback functions */
 static void menu_vis_toggle(void* userdata);
@@ -222,7 +244,7 @@ static int audio_callback(void* context, int16_t* left, int16_t* right, int len)
 {
     VGMPlayer* p = (VGMPlayer*)context;
 
-    if (p->state != STATE_PLAYING || (!p->vgm && !p->sid && !p->mod)) {
+    if (p->state != STATE_PLAYING || (!p->vgm && !p->sid && !p->mod && !p->spc)) {
         memset(left, 0, len * sizeof(int16_t));
         if (right) memset(right, 0, len * sizeof(int16_t));
         return p->state == STATE_PLAYING ? 1 : 0;
@@ -323,6 +345,11 @@ static int audio_callback(void* context, int16_t* left, int16_t* right, int len)
 /* ── Decode one chunk and append to ring buffer ─────────────────────── */
 
 
+/* Decode performance tracking */
+static float decode_time_accum = 0.0f;  /* accumulated decode time this log period */
+static int   decode_chunks_accum = 0;   /* chunks decoded this log period */
+static int   decode_log_frames = 0;     /* frame counter for periodic logging */
+
 static void decode_fill_ring(void)
 {
     VGMPlayer* p = &g_player;
@@ -332,8 +359,12 @@ static void decode_fill_ring(void)
 
     int decoded = 0;
 
+    float t0 = p->pd->system->getElapsedTime();
+
     if (p->sid) {
         decoded = sid_player_fill(p->sid, p->decode_tmp, DECODE_CHUNK);
+    } else if (p->spc) {
+        decoded = spc_player_fill(p->spc, p->decode_tmp, DECODE_CHUNK);
     } else if (p->mod) {
         decoded = mod_player_fill(p->mod, p->decode_tmp, DECODE_CHUNK);
     } else if (p->vgm) {
@@ -342,12 +373,16 @@ static void decode_fill_ring(void)
             decoded = p->vgm->decoder->buf_samples;
     }
 
+    float dt = p->pd->system->getElapsedTime() - t0;
+    decode_time_accum += dt;
+    decode_chunks_accum++;
+
     if (decoded <= 0) {
         p->stream_ended = 1;
         return;
     }
 
-    /* Downmix stereo → mono in-place when force_mono is active */
+    /* Downmix stereo → mono in-place when mono output is active */
     if (p->source_channels > 1 && p->channels == 1) {
         for (int i = 0; i < decoded; i++)
             p->decode_tmp[i] = (p->decode_tmp[i * 2] + p->decode_tmp[i * 2 + 1]) / 2;
@@ -369,30 +404,69 @@ static void decode_fill_ring(void)
 
 /* ── Pre-fill ring buffer from update() — keeps audio fed ───────────── */
 
-/* Decode time budgets (seconds).  At 50 fps each frame is 20 ms.
- * On non-draw frames the full frame is available for decoding.
- * On draw frames we must leave headroom for the display update. */
-#define DECODE_BUDGET_NODRAW_S  0.018f  /* 18 ms — non-draw frames */
-#define DECODE_BUDGET_DRAW_S    0.010f  /* 10 ms — draw frames     */
+/* Decode time budgets (seconds).
+ * Draw frames get a shorter budget so drawing can finish within 20 ms.
+ * No-draw frames get more time to replenish the ring buffer.
+ * With prefill at start (player_play fills to 50%), the ring starts
+ * full and the draw/no-draw alternation maintains it. */
+#define DECODE_BUDGET_DRAW_S    0.012f  /* 12 ms — leaves ~8 ms for draw  */
+#define DECODE_BUDGET_NODRAW_S  0.019f  /* 19 ms — max decode on skip     */
+#define RING_SKIP_THRESHOLD     2048    /* skip draw when ring below this  */
 
 static void player_prefill_audio(float budget)
 {
     VGMPlayer* p = &g_player;
     if (p->state != STATE_PLAYING) return;
-    if (!p->vgm && !p->sid && !p->mod) return;
+    if (!p->vgm && !p->sid && !p->mod && !p->spc) return;
 
     /* Decode until the ring buffer is ≥75 % full, the stream ends,
-     * or we exhaust the time budget — whichever comes first. */
+     * or we exhaust the time budget — whichever comes first.
+     * Always decode at least one chunk per frame to prevent starvation,
+     * then strictly respect the budget to keep UI responsive. */
     int target = RING_BUF_SAMPLES * 3 / 4;
+    int chunks_before = decode_chunks_accum;
     p->pd->system->resetElapsedTime();
+    decode_fill_ring();  /* always at least one chunk */
     while (ring_avail(p) < target && !p->stream_ended) {
-        decode_fill_ring();
         if (p->pd->system->getElapsedTime() >= budget)
             break;
+        decode_fill_ring();
+    }
+    float frame_decode_time = p->pd->system->getElapsedTime();
+    int chunks_this_frame = decode_chunks_accum - chunks_before;
+    int ring_fill = ring_avail(p);
+    int hit_budget = (frame_decode_time >= budget * 0.95f);
+
+    /* Log every 50 frames (~1 second) */
+    decode_log_frames++;
+    if (decode_log_frames >= 50) {
+        float avg_chunk_ms = (decode_chunks_accum > 0)
+            ? (decode_time_accum / decode_chunks_accum) * 1000.0f : 0.0f;
+        const char* fmt_name = p->sid ? "SID" : p->spc ? "SPC" : p->mod ? "MOD" : "VGM";
+        p->pd->system->logToConsole(
+            "[%s] avg=%.2fms/chunk  this_frame: %d chunks in %.1fms (budget=%.0fms%s)  ring=%d/%d",
+            fmt_name, (double)avg_chunk_ms,
+            chunks_this_frame, (double)(frame_decode_time * 1000.0f),
+            (double)(budget * 1000.0f), hit_budget ? " HIT" : "",
+            ring_fill, RING_BUF_SAMPLES);
+        decode_time_accum = 0.0f;
+        decode_chunks_accum = 0;
+        decode_log_frames = 0;
+    }
+
+    /* SID silence detection: auto-skip when subtune goes silent */
+    if (p->sid && sid_player_is_silent(p->sid)) {
+        if (p->subtrack_count > 0 && p->subtrack_index < p->subtrack_count) {
+            /* More subtunes — advance to next */
+            player_switch_subtrack(p->subtrack_index + 1);
+        } else {
+            /* Last subtune or no subtunes — treat as stream ended */
+            p->stream_ended = 1;
+        }
     }
 
     /* If stream ended and ring buffer is empty, handle repeat/auto-play logic */
-    if (p->stream_ended && ring_avail(p) <= 0 && !p->sid) {
+    if (p->stream_ended && ring_avail(p) <= 0 && !p->spc) {
         /* Repeat mode: track = 1, all = 2, off = 0 */
         if (p->repeat_mode == 1) {
             /* Repeat current track */
@@ -438,10 +512,16 @@ static int player_open_file(const char* path)
     /* Close previous stream if any */
     player_close();
 
-    strncpy(p->current_file, path, MAX_PATH - 1);
+    snprintf(p->current_file, MAX_PATH, "%s", path);
     p->track_title[0] = '\0';
     p->title_scroll_x = 0;
     p->title_scroll_wait = 60;  /* pause at start before scrolling */
+    p->subtrack_count = 0;
+    p->subtrack_index = 1;
+    p->btn_prev_hold_frames = 0;
+    p->btn_next_hold_frames = 0;
+    p->crank_paused = 0;
+    p->crank_accum  = 0.0f;
 
     /* ── Route .sid files to the built-in SID emulator ── */
     const char* ext = strrchr(path, '.');
@@ -474,12 +554,60 @@ static int player_open_file(const char* path)
                 snprintf(p->track_title, sizeof(p->track_title),
                          "%s / %s", title, author);
             else
-                strncpy(p->track_title, title, sizeof(p->track_title) - 1);
+                snprintf(p->track_title, sizeof(p->track_title), "%s", title);
+        }
+
+        /* Populate subtrack info */
+        int subtune_count = sid_player_subtune_count(p->sid);
+        if (subtune_count > 1) {
+            p->subtrack_count = subtune_count;
+            p->subtrack_index = 1;
         }
 
         p->pd->system->logToConsole(
-            "SID: opened %s - %dch %dHz (looping)",
-            path, p->channels, p->sample_rate
+            "SID: opened %s - %dch %dHz (looping) subtunes=%d",
+            path, p->channels, p->sample_rate, subtune_count
+        );
+        return 1;
+    }
+
+    /* ── Route .spc files to blargg's snes_spc ── */
+    if (ext && strcasecmp(ext, ".spc") == 0) {
+        p->spc = spc_player_open(p->pd, path);
+        if (!p->spc) {
+            snprintf(p->error_msg, sizeof(p->error_msg),
+                     "SPC load failed: %s", path);
+            p->state = STATE_ERROR;
+            return 0;
+        }
+        p->source_channels = spc_player_channels(p->spc);
+        p->channels      = (p->force_mono && p->source_channels > 1)
+                           ? 1 : p->source_channels;
+        p->sample_rate   = spc_player_sample_rate(p->spc);
+        p->total_samples = spc_player_total_samples(p->spc);  /* 0 = infinite */
+        p->current_sample = 0;
+        /* 32000 Hz → 44100 Hz resampling */
+        if (p->sample_rate != PLAYDATE_AUDIO_RATE) {
+            p->resample_step = ((uint32_t)p->sample_rate << 16) / PLAYDATE_AUDIO_RATE;
+        } else {
+            p->resample_step = 0;
+        }
+        p->resample_frac = 0;
+
+        /* Populate track title */
+        const char* title = spc_player_title(p->spc);
+        const char* game  = spc_player_game(p->spc);
+        if (title[0] != '\0') {
+            if (game[0] != '\0')
+                snprintf(p->track_title, sizeof(p->track_title),
+                         "%s / %s", title, game);
+            else
+                snprintf(p->track_title, sizeof(p->track_title), "%s", title);
+        }
+
+        p->pd->system->logToConsole(
+            "SPC: opened %s - %dch->%dch %dHz (looping)",
+            path, p->source_channels, p->channels, p->sample_rate
         );
         return 1;
     }
@@ -491,8 +619,10 @@ static int player_open_file(const char* path)
                 strcasecmp(ext, ".s3m") == 0)) {
         p->mod = mod_player_open(p->pd, path, p->force_mono);
         if (!p->mod) {
+            const char* reason = mod_player_last_error();
             snprintf(p->error_msg, sizeof(p->error_msg),
-                     "Tracker load failed: %s", path);
+                     "Tracker: %s\n%s",
+                     reason[0] ? reason : "load failed", path);
             p->state = STATE_ERROR;
             return 0;
         }
@@ -506,7 +636,7 @@ static int player_open_file(const char* path)
 
         const char* title = mod_player_title(p->mod);
         if (title[0] != '\0')
-            strncpy(p->track_title, title, sizeof(p->track_title) - 1);
+            snprintf(p->track_title, sizeof(p->track_title), "%s", title);
 
         p->pd->system->logToConsole(
             "MOD: opened %s - %dch %dHz %d samples",
@@ -571,9 +701,16 @@ static int player_open_file(const char* path)
         p->resample_frac = 0;
     }
 
+    /* Populate subtrack info — VGMstream subsongs are 1-based */
+    if (fmt->subsong_count > 1) {
+        p->subtrack_count = fmt->subsong_count;
+        p->subtrack_index = (fmt->subsong_index > 0) ? fmt->subsong_index : 1;
+    }
+
     p->pd->system->logToConsole(
-        "VGM: opened %s - %dch->%dch %dHz %d samples",
-        path, p->source_channels, p->channels, p->sample_rate, (int)p->total_samples
+        "VGM: opened %s - %dch->%dch %dHz %d samples subsongs=%d",
+        path, p->source_channels, p->channels, p->sample_rate,
+        (int)p->total_samples, fmt->subsong_count
     );
 
     return 1;
@@ -598,6 +735,10 @@ static void player_close(void)
         mod_player_close(p->mod);
         p->mod = NULL;
     }
+    if (p->spc) {
+        spc_player_close(p->spc);
+        p->spc = NULL;
+    }
     p->ring_read     = 0;
     p->ring_write    = 0;
     p->stream_ended  = 0;
@@ -607,10 +748,18 @@ static void player_close(void)
 static void player_play(void)
 {
     VGMPlayer* p = &g_player;
-    if (!p->vgm && !p->sid && !p->mod) return;
+    if (!p->vgm && !p->sid && !p->mod && !p->spc) return;
 
+    /* Pre-fill the ring buffer BEFORE starting the audio source.
+     * This banks samples with zero consumption, giving heavy tracks
+     * (SPC/SID at near 1:1 real-time decode) a comfortable buffer
+     * that sustains smooth playback for several seconds. */
     if (!p->audio_source) {
-        /* Register audio callback — stereo if file is stereo */
+        int prefill_target = RING_BUF_SAMPLES / 2;
+        while (ring_avail(p) < prefill_target && !p->stream_ended)
+            decode_fill_ring();
+
+        /* NOW start audio consumption */
         int stereo = (p->channels > 1) ? 1 : 0;
         p->audio_source = p->pd->sound->addSource(
             audio_callback,
@@ -627,8 +776,7 @@ static void player_play(void)
         p->menu_vis_fs = p->pd->system->addCheckmarkMenuItem(
             "Display: Fullscreen", 0, menu_vis_fullscreen, p);
         p->menu_mono = p->pd->system->addCheckmarkMenuItem(
-            "Audio: Mono Output", 1, menu_mono_toggle, p);
-        
+            "Audio: Mono Output", p->force_mono, menu_mono_toggle, p);
         /* ── Playing Mode options ── */
         p->menu_repeat = p->pd->system->addOptionsMenuItem(
             "Playing: Repeat",
@@ -697,6 +845,8 @@ static void player_seek(int32_t sample)
         libvgmstream_seek(p->vgm, sample);
     } else if (p->mod) {
         mod_player_seek(p->mod, sample);
+    } else if (p->spc) {
+        spc_player_seek(p->spc, sample);
     } else {
         return;
     }
@@ -706,6 +856,61 @@ static void player_seek(int32_t sample)
     p->ring_write    = 0;
     p->stream_ended  = 0;
     p->needs_redraw  = 1;
+}
+
+/* ── Switch to subtrack n (1-based, wraps around) ───────────────────── */
+
+static void player_switch_subtrack(int n)
+{
+    VGMPlayer* p = &g_player;
+    if (p->subtrack_count <= 0) return;
+
+    /* Wrap around */
+    if (n < 1) n = p->subtrack_count;
+    if (n > p->subtrack_count) n = 1;
+
+    if (p->sid) {
+        sid_player_set_subtune(p->sid, n);
+        p->subtrack_index = n;
+    } else if (p->vgm) {
+        /* Re-apply config before re-opening at new subsong */
+        libvgmstream_config_t cfg = {0};
+        cfg.loop_count = 1;
+        libvgmstream_setup(p->vgm, &cfg);
+
+        int err = libvgmstream_open_stream(p->vgm, p->libsf, n);
+        if (err < 0) {
+            p->pd->system->logToConsole("VGM: failed to switch to subsong %d", n);
+            return;
+        }
+
+        /* Update playback parameters from new subsong */
+        const libvgmstream_format_t* fmt = p->vgm->format;
+        p->subtrack_index  = n;
+        p->source_channels = fmt->channels;
+        p->channels        = (p->force_mono && fmt->channels > 1) ? 1 : fmt->channels;
+        p->sample_rate     = fmt->sample_rate;
+        p->total_samples   = fmt->stream_samples;
+
+        /* Update resampler */
+        if (p->sample_rate != PLAYDATE_AUDIO_RATE) {
+            p->resample_step = ((uint32_t)p->sample_rate << 16) / PLAYDATE_AUDIO_RATE;
+        } else {
+            p->resample_step = 0;
+        }
+        p->resample_frac = 0;
+    } else {
+        return;
+    }
+
+    /* Flush ring buffer and reset position */
+    p->ring_read      = 0;
+    p->ring_write     = 0;
+    p->stream_ended   = 0;
+    p->current_sample = 0;
+    p->needs_redraw   = 1;
+
+    p->pd->system->logToConsole("Switched to subtrack %d/%d", n, p->subtrack_count);
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -727,7 +932,7 @@ static const char* const BROWSER_SUPPORTED_EXT[] = {
     ".dsp",  ".hca",  ".idsp",  ".vag",   ".vagp",
     ".wem",  ".xwb",  ".fsb",   ".bnk",   ".acb",
     ".awb",  ".txtp", ".str",   ".ss2",   ".ads",
-    ".mib",  ".sid",
+    ".mib",  ".sid",  ".spc",
     ".mod",  ".xm",   ".it",   ".s3m",
     NULL
 };
@@ -802,19 +1007,19 @@ static void browser_scan(const char* directory)
 
     p->browser_count = 0;
     p->browser_selection = 0;
-    strncpy(p->current_dir, directory, sizeof(p->current_dir) - 1);
+    snprintf(p->current_dir, sizeof(p->current_dir), "%s", directory);
 
     /* Add "../" parent navigation entry if not at the root "vgm" directory */
     if (strcmp(directory, "vgm") != 0) {
         char parent_path[MAX_PATH];
-        strncpy(parent_path, directory, sizeof(parent_path) - 1);
+        snprintf(parent_path, sizeof(parent_path), "%s", directory);
         char* last_slash = strrchr(parent_path, '/');
         if (last_slash) {
             *last_slash = '\0';
         } else {
-            strncpy(parent_path, "vgm", sizeof(parent_path) - 1);
+            snprintf(parent_path, sizeof(parent_path), "vgm");
         }
-        strncpy(p->browser_files[0], parent_path, MAX_PATH - 1);
+        snprintf(p->browser_files[0], MAX_PATH, "%s", parent_path);
         p->browser_is_dir[0] = 2;  /* parent nav */
         p->browser_count = 1;
     }
@@ -887,7 +1092,7 @@ static void browser_draw(void)
         char display_name[MAX_PATH + 2];
         if (p->browser_is_dir[i] == 2) {
             /* Parent navigation entry */
-            strncpy(display_name, "../", sizeof(display_name) - 1);
+            snprintf(display_name, sizeof(display_name), "../");
         } else if (p->browser_is_dir[i] == 1) {
             /* Subdirectory: show just the dirname with trailing slash */
             const char* dname = strrchr(p->browser_files[i], '/');
@@ -897,7 +1102,7 @@ static void browser_draw(void)
             /* Regular file: show just the filename */
             const char* fname = strrchr(p->browser_files[i], '/');
             fname = fname ? fname + 1 : p->browser_files[i];
-            strncpy(display_name, fname, sizeof(display_name) - 1);
+            snprintf(display_name, sizeof(display_name), "%s", fname);
         }
 
         pd->graphics->drawText(display_name, strlen(display_name),
@@ -1138,14 +1343,21 @@ static void player_draw(void)
 
         /* Time display */
         int cur_sec = p->current_sample / p->sample_rate;
+        char time_str[64];
         if (p->total_samples > 0) {
             int tot_sec = p->total_samples / p->sample_rate;
-            snprintf(info, sizeof(info), "%d:%02d / %d:%02d",
+            snprintf(time_str, sizeof(time_str), "%d:%02d / %d:%02d",
                      cur_sec / 60, cur_sec % 60,
                      tot_sec / 60, tot_sec % 60);
         } else {
-            snprintf(info, sizeof(info), "%d:%02d / looping",
+            snprintf(time_str, sizeof(time_str), "%d:%02d / looping",
                      cur_sec / 60, cur_sec % 60);
+        }
+        if (p->subtrack_count > 0) {
+            snprintf(info, sizeof(info), "%s  [%d/%d]",
+                     time_str, p->subtrack_index, p->subtrack_count);
+        } else {
+            snprintf(info, sizeof(info), "%s", time_str);
         }
         int time_w = pd->graphics->getTextWidth(NULL, info, strlen(info),
                                                  kASCIIEncoding, 0);
@@ -1225,13 +1437,33 @@ static void draw_button_bar(PlaydateAPI* pd, VGMPlayer* p) {
     pd->graphics->fillRect(0, bar_y, 400, bar_h, kColorWhite);
     pd->graphics->drawLine(0, bar_y, 400, bar_y, 1, kColorBlack);
 
-    int icon_size = 8;  /* size of drawn icons */
+    int icon_size = 8;
     int cx, cy;
+
+    /* Helper: determine if a button should show inverted (blinking) */
+    int blinking = (p->btn_blink_timer > 0);
+
+    /* Hold state for prev/next — used for fill-up animation */
+    int hold_prev = p->btn_prev_hold_frames;
+    int hold_next = p->btn_next_hold_frames;
+
+    /* Is a hold animation active on button 0 or 4? If so, suppress
+     * the normal selected fill — the hold fill-up replaces it. */
+    int hold_active_0 = (hold_prev > 0 && hold_prev <= HOLD_FRAMES_THRESHOLD &&
+                         p->subtrack_count > 0 && p->selected_button == 0);
+    int hold_active_4 = (hold_next > 0 && hold_next <= HOLD_FRAMES_THRESHOLD &&
+                         p->subtrack_count > 0 && p->selected_button == 4);
+
+    /* Helper macro: is button i "filled" (selected or blinking)?
+     * Suppressed when hold fill-up animation is active on that button. */
+    #define BTN_FILLED(i) \
+        (((p->selected_button == (i)) && !((i) == 0 && hold_active_0) && !((i) == 4 && hold_active_4)) \
+         ^ (blinking && p->btn_blink_which == (i)))
 
     /* Button 0: Previous track (|◀◀) */
     cx = p->buttons[0].x + p->buttons[0].w / 2;
     cy = p->buttons[0].y + p->buttons[0].h / 2;
-    if (p->selected_button == 0) {
+    if (BTN_FILLED(0)) {
         pd->graphics->fillRect(p->buttons[0].x, p->buttons[0].y, p->buttons[0].w, p->buttons[0].h, kColorBlack);
         pd->graphics->fillRect(cx - 9, cy - 5, 2, 10, kColorWhite);
         draw_triangle_left(pd, cx - 3, cy, icon_size, kColorWhite);
@@ -1246,7 +1478,7 @@ static void draw_button_bar(PlaydateAPI* pd, VGMPlayer* p) {
     /* Button 1: Seek backward (◄◄) */
     cx = p->buttons[1].x + p->buttons[1].w / 2;
     cy = p->buttons[1].y + p->buttons[1].h / 2;
-    if (p->selected_button == 1) {
+    if (BTN_FILLED(1)) {
         pd->graphics->fillRect(p->buttons[1].x, p->buttons[1].y, p->buttons[1].w, p->buttons[1].h, kColorBlack);
         draw_triangle_left(pd, cx - 3, cy, icon_size, kColorWhite);
         draw_triangle_left(pd, cx + 3, cy, icon_size, kColorWhite);
@@ -1259,24 +1491,20 @@ static void draw_button_bar(PlaydateAPI* pd, VGMPlayer* p) {
     /* Button 2: Play/Pause */
     cx = p->buttons[2].x + p->buttons[2].w / 2;
     cy = p->buttons[2].y + p->buttons[2].h / 2;
-    if (p->selected_button == 2) {
+    if (BTN_FILLED(2)) {
         pd->graphics->fillRect(p->buttons[2].x, p->buttons[2].y, p->buttons[2].w, p->buttons[2].h, kColorBlack);
         if (p->state == STATE_PLAYING) {
-            /* Pause icon: two vertical bars (white) */
             pd->graphics->fillRect(cx - 4, cy - 4, 2, 8, kColorWhite);
             pd->graphics->fillRect(cx + 2, cy - 4, 2, 8, kColorWhite);
         } else {
-            /* Play icon: right triangle (white) */
             draw_triangle_right(pd, cx, cy, icon_size, kColorWhite);
         }
     } else {
         pd->graphics->drawRect(p->buttons[2].x, p->buttons[2].y, p->buttons[2].w, p->buttons[2].h, kColorBlack);
         if (p->state == STATE_PLAYING) {
-            /* Pause icon: two vertical bars (black) */
             pd->graphics->fillRect(cx - 4, cy - 4, 2, 8, kColorBlack);
             pd->graphics->fillRect(cx + 2, cy - 4, 2, 8, kColorBlack);
         } else {
-            /* Play icon: right triangle (black) */
             draw_triangle_right(pd, cx, cy, icon_size, kColorBlack);
         }
     }
@@ -1284,7 +1512,7 @@ static void draw_button_bar(PlaydateAPI* pd, VGMPlayer* p) {
     /* Button 3: Seek forward (►►) */
     cx = p->buttons[3].x + p->buttons[3].w / 2;
     cy = p->buttons[3].y + p->buttons[3].h / 2;
-    if (p->selected_button == 3) {
+    if (BTN_FILLED(3)) {
         pd->graphics->fillRect(p->buttons[3].x, p->buttons[3].y, p->buttons[3].w, p->buttons[3].h, kColorBlack);
         draw_triangle_right(pd, cx - 3, cy, icon_size, kColorWhite);
         draw_triangle_right(pd, cx + 3, cy, icon_size, kColorWhite);
@@ -1297,7 +1525,7 @@ static void draw_button_bar(PlaydateAPI* pd, VGMPlayer* p) {
     /* Button 4: Next track (►►|) */
     cx = p->buttons[4].x + p->buttons[4].w / 2;
     cy = p->buttons[4].y + p->buttons[4].h / 2;
-    if (p->selected_button == 4) {
+    if (BTN_FILLED(4)) {
         pd->graphics->fillRect(p->buttons[4].x, p->buttons[4].y, p->buttons[4].w, p->buttons[4].h, kColorBlack);
         draw_triangle_right(pd, cx - 4, cy, icon_size, kColorWhite);
         draw_triangle_right(pd, cx + 3, cy, icon_size, kColorWhite);
@@ -1312,7 +1540,7 @@ static void draw_button_bar(PlaydateAPI* pd, VGMPlayer* p) {
     /* Button 5: Shuffle */
     cx = p->buttons[5].x + p->buttons[5].w / 2;
     cy = p->buttons[5].y + p->buttons[5].h / 2;
-    if (p->shuffle_enabled || p->selected_button == 5) {
+    if (p->shuffle_enabled || BTN_FILLED(5)) {
         pd->graphics->fillRect(p->buttons[5].x, p->buttons[5].y, p->buttons[5].w, p->buttons[5].h, kColorBlack);
         pd->graphics->setDrawMode(kDrawModeInverted);
         pd->graphics->drawText("S", 1, kASCIIEncoding, cx - 3, cy - 8);
@@ -1322,12 +1550,10 @@ static void draw_button_bar(PlaydateAPI* pd, VGMPlayer* p) {
         pd->graphics->drawText("S", 1, kASCIIEncoding, cx - 3, cy - 8);
     }
 
-
-
     /* Button 6: Repeat */
     cx = p->buttons[6].x + p->buttons[6].w / 2;
     cy = p->buttons[6].y + p->buttons[6].h / 2;
-    if (p->repeat_mode > 0 || p->selected_button == 6) {
+    if (p->repeat_mode > 0 || BTN_FILLED(6)) {
         pd->graphics->fillRect(p->buttons[6].x, p->buttons[6].y, p->buttons[6].w, p->buttons[6].h, kColorBlack);
         pd->graphics->setDrawMode(kDrawModeInverted);
         pd->graphics->drawText("R", 1, kASCIIEncoding, cx - 3, cy - 8);
@@ -1337,6 +1563,41 @@ static void draw_button_bar(PlaydateAPI* pd, VGMPlayer* p) {
         pd->graphics->drawText("R", 1, kASCIIEncoding, cx - 3, cy - 8);
     }
 
+    #undef BTN_FILLED
+
+    /* ── Hold fill-up animation for prev/next when subtracks exist ── */
+    /* Drawn AFTER the button outline + black icons.  The partial black
+     * fill progressively covers the button from left to right.
+     * The icon is redrawn in white within the filled area using a clip
+     * rect so it stays visible as the fill progresses. */
+    for (int bi = 0; bi <= 4; bi += 4) {  /* bi = 0 (prev) or 4 (next) */
+        int hold = (bi == 0) ? hold_prev : hold_next;
+        if (hold > 0 && hold <= HOLD_FRAMES_THRESHOLD &&
+            p->subtrack_count > 0 && p->selected_button == bi) {
+            int bx = p->buttons[bi].x;
+            int by = p->buttons[bi].y;
+            int bw = p->buttons[bi].w;
+            int bh = p->buttons[bi].h;
+            int fill_w = (bw * hold) / HOLD_FRAMES_THRESHOLD;
+            if (fill_w > 0) {
+                pd->graphics->fillRect(bx, by, fill_w, bh, kColorBlack);
+                /* Redraw icon in white, clipped to the filled area */
+                pd->graphics->setClipRect(bx, by, fill_w, bh);
+                int icx = bx + bw / 2;
+                int icy = by + bh / 2;
+                if (bi == 0) {
+                    pd->graphics->fillRect(icx - 9, icy - 5, 2, 10, kColorWhite);
+                    draw_triangle_left(pd, icx - 3, icy, icon_size, kColorWhite);
+                    draw_triangle_left(pd, icx + 4, icy, icon_size, kColorWhite);
+                } else {
+                    draw_triangle_right(pd, icx - 4, icy, icon_size, kColorWhite);
+                    draw_triangle_right(pd, icx + 3, icy, icon_size, kColorWhite);
+                    pd->graphics->fillRect(icx + 7, icy - 5, 2, 10, kColorWhite);
+                }
+                pd->graphics->clearClipRect();
+            }
+        }
+    }
 }
 
 static void vis_fullscreen_draw(void)
@@ -1372,7 +1633,7 @@ static void vis_fullscreen_draw(void)
         draw_pause_icon(pd, 6, 226, kColorWhite);
     }
 
-    char overlay[64];
+    char overlay[80];
     int cur_sec = p->current_sample / p->sample_rate;
     if (p->total_samples > 0) {
         int tot_sec = p->total_samples / p->sample_rate;
@@ -1380,6 +1641,12 @@ static void vis_fullscreen_draw(void)
                  cur_sec / 60, cur_sec % 60, tot_sec / 60, tot_sec % 60);
     } else {
         snprintf(overlay, sizeof(overlay), "%d:%02d", cur_sec / 60, cur_sec % 60);
+    }
+    if (p->subtrack_count > 0) {
+        char sub_str[16];
+        snprintf(sub_str, sizeof(sub_str), " [%d/%d]",
+                 p->subtrack_index, p->subtrack_count);
+        strncat(overlay, sub_str, sizeof(overlay) - strlen(overlay) - 1);
     }
     pd->graphics->setDrawMode(kDrawModeInverted);
     pd->graphics->drawText(overlay, strlen(overlay),
@@ -1479,7 +1746,23 @@ static void title_for_file(const char* path, char* buf, int buf_size)
                 char title[33];
                 memcpy(title, hdr + 0x16, 32); title[32] = '\0';
                 if (title[0] != '\0')
-                    strncpy(buf, title, buf_size - 1);
+                    snprintf(buf, buf_size, "%s", title);
+            }
+            p->pd->file->close(f);
+        }
+    } else if (ext && strcasecmp(ext, ".spc") == 0) {
+        /* Read title from the SPC ID666 tag (fixed offset in header).
+         * No emulator state needed — just a file read. */
+        SDFile* f = p->pd->file->open(path, kFileRead | kFileReadData);
+        if (f) {
+            /* SPC header: title at 0x2E (32 bytes) */
+            unsigned char hdr[0x4E];
+            if (p->pd->file->read(f, hdr, sizeof(hdr)) == (int)sizeof(hdr)
+                && hdr[0x23] == 0x1A) {
+                char title[33];
+                memcpy(title, hdr + 0x2E, 32); title[32] = '\0';
+                if (title[0] != '\0')
+                    snprintf(buf, buf_size, "%s", title);
             }
             p->pd->file->close(f);
         }
@@ -1491,7 +1774,7 @@ static void title_for_file(const char* path, char* buf, int buf_size)
         if (mp) {
             const char* title = mod_player_title(mp);
             if (title[0] != '\0')
-                strncpy(buf, title, buf_size - 1);
+                snprintf(buf, buf_size, "%s", title);
             mod_player_close(mp);
         }
     }
@@ -1501,7 +1784,7 @@ static void title_for_file(const char* path, char* buf, int buf_size)
     if (buf[0] == '\0') {
         const char* name = strrchr(path, '/');
         name = name ? name + 1 : path;
-        strncpy(buf, name, buf_size - 1);
+        snprintf(buf, buf_size, "%s", name);
         buf[buf_size - 1] = '\0';
     }
 }
@@ -1566,10 +1849,12 @@ static void error_draw(void)
  * ══════════════════════════════════════════════════════════════════════ */
 
 /* Shared button handler for STATE_PLAYING and STATE_PAUSED */
-static void handle_playback_input(VGMPlayer* p, PDButtons pushed)
+static void handle_playback_input(VGMPlayer* p, PDButtons current, PDButtons pushed, PDButtons released)
 {
     /* Fullscreen visualizer: A = play/pause, left/right = seek */
     if (p->vis_enabled && p->vis_fullscreen) {
+        p->btn_prev_hold_frames = 0;
+        p->btn_next_hold_frames = 0;
         if (pushed & kButtonA) {
             if (p->state == STATE_PAUSED) player_play();
             else player_pause();
@@ -1583,6 +1868,74 @@ static void handle_playback_input(VGMPlayer* p, PDButtons pushed)
         return;
     }
 
+    /* ── Hold detection for prev/next (A held while button 0/4 selected) ── */
+    /* Save hold frames before potential reset — needed by release handler */
+    int prev_hold_at_release = p->btn_prev_hold_frames;
+    int next_hold_at_release = p->btn_next_hold_frames;
+
+    if ((current & kButtonA) && p->selected_button == 0) {
+        p->btn_prev_hold_frames++;
+    } else {
+        p->btn_prev_hold_frames = 0;
+    }
+    if ((current & kButtonA) && p->selected_button == 4) {
+        p->btn_next_hold_frames++;
+    } else {
+        p->btn_next_hold_frames = 0;
+    }
+    if (!(current & kButtonA)) {
+        p->btn_long_fired = 0;
+    }
+
+    /* Fire long-press immediately when threshold is reached */
+    if (p->selected_button == 0 &&
+        p->btn_prev_hold_frames == HOLD_FRAMES_THRESHOLD &&
+        p->subtrack_count > 0) {
+        /* Long-press prev → prev song (no blink — fill-up was the feedback) */
+        if (p->browser_count > 0 && p->current_song_index >= 0) {
+            int prev_idx = -1;
+            if (p->shuffle_enabled) {
+                for (int i = 0; i < p->shuffled_count; i++) {
+                    if (p->shuffled_indices[i] == p->current_song_index && i > 0) {
+                        prev_idx = p->shuffled_indices[i - 1];
+                        break;
+                    }
+                }
+            } else {
+                int prev_cand = p->current_song_index - 1;
+                while (prev_cand >= 0 && p->browser_is_dir[prev_cand] != 0)
+                    prev_cand--;
+                if (prev_cand >= 0) prev_idx = prev_cand;
+            }
+            if (prev_idx >= 0 && prev_idx < p->browser_count) {
+                p->current_song_index = prev_idx;
+                if (player_open_file(p->browser_files[prev_idx])) {
+                    update_prev_next_display(p);
+                    player_play();
+                    p->needs_redraw = 1;
+                }
+            }
+        }
+        p->btn_prev_hold_frames++;  /* prevent re-firing */
+        p->btn_long_fired = 1;
+    }
+    if (p->selected_button == 4 &&
+        p->btn_next_hold_frames == HOLD_FRAMES_THRESHOLD &&
+        p->subtrack_count > 0) {
+        /* Long-press next → next song (no blink — fill-up was the feedback) */
+        int next_idx = get_next_song_index(p);
+        if (next_idx >= 0 && next_idx < p->browser_count) {
+            p->current_song_index = next_idx;
+            if (player_open_file(p->browser_files[next_idx])) {
+                update_prev_next_display(p);
+                player_play();
+                p->needs_redraw = 1;
+            }
+        }
+        p->btn_next_hold_frames++;  /* prevent re-firing */
+        p->btn_long_fired = 1;
+    }
+
     /* D-pad left/right → cycle through button bar */
     if (pushed & kButtonLeft) {
         p->selected_button = (p->selected_button - 1 + 7) % 7;
@@ -1593,33 +1946,44 @@ static void handle_playback_input(VGMPlayer* p, PDButtons pushed)
         p->needs_redraw = 1;
     }
     if (pushed & kButtonA) {
+        /* Trigger blink on press — but NOT for prev/next when subtracks exist
+         * (those use hold fill-up animation and blink on release) */
+        int is_hold_btn = (p->selected_button == 0 || p->selected_button == 4) && p->subtrack_count > 0;
+        if (!is_hold_btn) {
+            p->btn_blink_which = p->selected_button;
+            p->btn_blink_timer = 4;  /* 4 frames ≈ 80ms flash */
+        }
+        p->needs_redraw = 1;
+
         switch (p->selected_button) {
-            case 0: { /* Previous track */
-                if (p->browser_count > 0 && p->current_song_index >= 0) {
-                    int prev_idx = -1;
-                    if (p->shuffle_enabled) {
-                        for (int i = 0; i < p->shuffled_count; i++) {
-                            if (p->shuffled_indices[i] == p->current_song_index && i > 0) {
-                                prev_idx = p->shuffled_indices[i - 1];
-                                break;
+            case 0: { /* Prev: when no subtracks, short press = prev song */
+                if (p->subtrack_count == 0) {
+                    if (p->browser_count > 0 && p->current_song_index >= 0) {
+                        int prev_idx = -1;
+                        if (p->shuffle_enabled) {
+                            for (int i = 0; i < p->shuffled_count; i++) {
+                                if (p->shuffled_indices[i] == p->current_song_index && i > 0) {
+                                    prev_idx = p->shuffled_indices[i - 1];
+                                    break;
+                                }
                             }
+                        } else {
+                            int prev_cand = p->current_song_index - 1;
+                            while (prev_cand >= 0 && p->browser_is_dir[prev_cand] != 0)
+                                prev_cand--;
+                            if (prev_cand >= 0) prev_idx = prev_cand;
                         }
-                    } else {
-                        int prev_cand = p->current_song_index - 1;
-                        while (prev_cand >= 0 && p->browser_is_dir[prev_cand] != 0)
-                            prev_cand--;
-                        if (prev_cand >= 0)
-                            prev_idx = prev_cand;
-                    }
-                    if (prev_idx >= 0 && prev_idx < p->browser_count) {
-                        p->current_song_index = prev_idx;
-                        if (player_open_file(p->browser_files[prev_idx])) {
-                            update_prev_next_display(p);
-                            player_play();
-                            p->needs_redraw = 1;
+                        if (prev_idx >= 0 && prev_idx < p->browser_count) {
+                            p->current_song_index = prev_idx;
+                            if (player_open_file(p->browser_files[prev_idx])) {
+                                update_prev_next_display(p);
+                                player_play();
+                                p->needs_redraw = 1;
+                            }
                         }
                     }
                 }
+                /* With subtracks: action deferred to release (below) */
                 break;
             }
             case 1:  /* Seek backward 5 sec */
@@ -1634,16 +1998,19 @@ static void handle_playback_input(VGMPlayer* p, PDButtons pushed)
                 if (p->total_samples > 0)
                     player_seek(p->current_sample + p->sample_rate * 5);
                 break;
-            case 4: { /* Next track */
-                int next_idx = get_next_song_index(p);
-                if (next_idx >= 0 && next_idx < p->browser_count) {
-                    p->current_song_index = next_idx;
-                    if (player_open_file(p->browser_files[next_idx])) {
-                        update_prev_next_display(p);
-                        player_play();
-                        p->needs_redraw = 1;
+            case 4: { /* Next: when no subtracks, short press = next song */
+                if (p->subtrack_count == 0) {
+                    int next_idx = get_next_song_index(p);
+                    if (next_idx >= 0 && next_idx < p->browser_count) {
+                        p->current_song_index = next_idx;
+                        if (player_open_file(p->browser_files[next_idx])) {
+                            update_prev_next_display(p);
+                            player_play();
+                            p->needs_redraw = 1;
+                        }
                     }
                 }
+                /* With subtracks: action deferred to release (below) */
                 break;
             }
             case 5:  /* Toggle shuffle */
@@ -1658,6 +2025,24 @@ static void handle_playback_input(VGMPlayer* p, PDButtons pushed)
                 break;
         }
     }
+    /* ── Release handler: prev/next subtrack on short press release ── */
+    if ((released & kButtonA) && p->subtrack_count > 0 && !p->btn_long_fired) {
+        if (p->selected_button == 0 && prev_hold_at_release > 0 &&
+            prev_hold_at_release < HOLD_FRAMES_THRESHOLD) {
+            p->btn_blink_which = 0;
+            p->btn_blink_timer = 4;
+            player_switch_subtrack(p->subtrack_index - 1);
+            p->needs_redraw = 1;
+        }
+        if (p->selected_button == 4 && next_hold_at_release > 0 &&
+            next_hold_at_release < HOLD_FRAMES_THRESHOLD) {
+            p->btn_blink_which = 4;
+            p->btn_blink_timer = 4;
+            player_switch_subtrack(p->subtrack_index + 1);
+            p->needs_redraw = 1;
+        }
+    }
+
     if (pushed & kButtonB)
         player_stop();
 }
@@ -1667,8 +2052,8 @@ static void handle_input(void)
     VGMPlayer* p = &g_player;
     PlaydateAPI* pd = p->pd;
 
-    PDButtons pushed;
-    pd->system->getButtonState(NULL, &pushed, NULL);
+    PDButtons current, pushed, released;
+    pd->system->getButtonState(&current, &pushed, &released);
 
     switch (p->state) {
     case STATE_BROWSER:
@@ -1709,10 +2094,10 @@ static void handle_input(void)
             /* Go up one directory level */
             if (strcmp(p->current_dir, "vgm") != 0) {
                 char parent_path[MAX_PATH];
-                strncpy(parent_path, p->current_dir, sizeof(parent_path) - 1);
+                snprintf(parent_path, sizeof(parent_path), "%s", p->current_dir);
                 char* last_slash = strrchr(parent_path, '/');
                 if (last_slash) *last_slash = '\0';
-                else strncpy(parent_path, "vgm", sizeof(parent_path) - 1);
+                else snprintf(parent_path, sizeof(parent_path), "vgm");
                 browser_scan(parent_path);
                 p->needs_redraw = 1;
             }
@@ -1721,7 +2106,7 @@ static void handle_input(void)
 
     case STATE_PLAYING:
     case STATE_PAUSED:
-        handle_playback_input(p, pushed);
+        handle_playback_input(p, current, pushed, released);
         break;
 
     case STATE_ERROR:
@@ -1730,6 +2115,48 @@ static void handle_input(void)
             p->needs_redraw = 1;
         }
         break;
+    }
+
+    /* ── Crank seek: undock pauses, crank seeks ±1s, re-dock resumes ── */
+    if (p->state == STATE_PLAYING || p->state == STATE_PAUSED) {
+        int docked = pd->system->isCrankDocked();
+
+        if (!docked && p->crank_docked) {
+            /* Crank just undocked — pause playback for seeking */
+            if (p->state == STATE_PLAYING && p->total_samples > 0) {
+                player_pause();
+                p->crank_paused = 1;
+                p->crank_accum  = 0.0f;
+                p->needs_redraw = 1;
+            }
+        } else if (docked && !p->crank_docked) {
+            /* Crank just re-docked — resume if we paused it */
+            if (p->crank_paused) {
+                player_play();
+                p->crank_paused = 0;
+                p->needs_redraw = 1;
+            }
+        }
+
+        /* While undocked and we're in crank-seek mode, accumulate rotation */
+        if (!docked && p->crank_paused && p->total_samples > 0) {
+            float change = pd->system->getCrankChange();
+            if (change != 0.0f) {
+                p->crank_accum += change;
+                /* Every 30° of rotation = 1 second of seek */
+                while (p->crank_accum >= 30.0f) {
+                    p->crank_accum -= 30.0f;
+                    player_seek(p->current_sample + p->sample_rate);
+                }
+                while (p->crank_accum <= -30.0f) {
+                    p->crank_accum += 30.0f;
+                    player_seek(p->current_sample - p->sample_rate);
+                }
+                p->needs_redraw = 1;
+            }
+        }
+
+        p->crank_docked = docked;
     }
 }
 
@@ -1761,7 +2188,7 @@ static void menu_mono_toggle(void* userdata) {
     p->force_mono = p->pd->system->getMenuItemValue(p->menu_mono);
 
     /* Reopen the current file to apply the new channel mode */
-    if ((p->mod || p->vgm) && p->current_file[0] != '\0') {
+    if ((p->mod || p->vgm || p->spc) && p->current_file[0] != '\0') {
         int was_playing = (p->state == STATE_PLAYING);
         int32_t pos = p->current_sample;
 
@@ -1804,8 +2231,10 @@ static void player_init(PlaydateAPI* pd)
     g_player.pd     = pd;
     g_player.state  = STATE_BROWSER;
     g_player.vis_enabled = 1;
-    g_player.force_mono = 1;  /* default: mono for better device performance */
+    g_player.force_mono = 0;  /* default: stereo output */
     g_player.needs_redraw = 1;
+    g_player.crank_docked = pd->system->isCrankDocked();
+    pd->system->setCrankSoundsDisabled(1);
 
     /* Initialise Playdate filesystem adapter for vgmstream */
     vgm_pd_streamfile_set_api(pd);
@@ -1823,11 +2252,27 @@ static int update(void* userdata)
 
     handle_input();
 
+    /* Tick blink timer — force redraw while blinking */
+    if (p->btn_blink_timer > 0) {
+        p->btn_blink_timer--;
+        p->needs_redraw = 1;
+    }
+    /* Force redraw during hold fill-up animation */
+    if (p->btn_prev_hold_frames > 0 || p->btn_next_hold_frames > 0)
+        p->needs_redraw = 1;
+
     int will_draw = p->needs_redraw;
+
+    /* Frame-skip: when the ring buffer is dangerously low, skip drawing
+     * this frame to give all CPU time to decoding.  The prefill at
+     * player_play() gives us a comfortable initial buffer; this logic
+     * only kicks in when heavy tracks start draining it. */
+    if (will_draw && p->state == STATE_PLAYING && ring_avail(p) < RING_SKIP_THRESHOLD)
+        will_draw = 0;
 
     /* Pre-fill audio ring buffer from the main thread so the audio
      * callback never has to decode (which would cause lag/stuttering).
-     * Use a larger budget on non-draw frames where we have more time. */
+     * Draw frames get a shorter budget; no-draw frames decode longer. */
     float budget = will_draw ? DECODE_BUDGET_DRAW_S : DECODE_BUDGET_NODRAW_S;
     player_prefill_audio(budget);
 
@@ -1883,7 +2328,7 @@ int eventHandler(PlaydateAPI* pd, PDSystemEvent event, uint32_t arg)
 
     case kEventResume:
         /* Resume playback that was paused when the system menu opened */
-        if (g_player.vgm || g_player.sid || g_player.mod)
+        if (g_player.vgm || g_player.sid || g_player.mod || g_player.spc)
             player_play();
         break;
 

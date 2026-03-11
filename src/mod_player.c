@@ -21,6 +21,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Last error reason — set by mod_player_open() on failure */
+static char mod_last_error[128] = "";
+
 struct ModPlayer {
     PlaydateAPI*  pd;
     xmp_context   ctx;
@@ -33,8 +36,11 @@ struct ModPlayer {
 ModPlayer* mod_player_open(PlaydateAPI* pd, const char* path, int mono)
 {
     /* ── Read the module file from the Playdate filesystem ──────────── */
+    mod_last_error[0] = '\0';
+
     SDFile* f = pd->file->open(path, kFileRead | kFileReadData);
     if (!f) {
+        snprintf(mod_last_error, sizeof(mod_last_error), "Cannot open file");
         pd->system->logToConsole("mod: failed to open %s", path);
         return NULL;
     }
@@ -43,9 +49,12 @@ ModPlayer* mod_player_open(PlaydateAPI* pd, const char* path, int mono)
     int filesize = pd->file->tell(f);
     pd->file->seek(f, 0, SEEK_SET);
 
-    /* Cap at 2 MB — Playdate has ~10 MB usable RAM */
-    if (filesize <= 0 || filesize > 2 * 1024 * 1024) {
-        pd->system->logToConsole("mod: file too large (%d bytes)", filesize);
+    /* Cap at 4 MB — Playdate has 16 MB total RAM; libxmp copies data
+     * internally so peak usage is ~2× filesize during load. */
+    if (filesize <= 0 || filesize > 4 * 1024 * 1024) {
+        snprintf(mod_last_error, sizeof(mod_last_error),
+                 "File too large (%d bytes, max 4MB)", filesize);
+        pd->system->logToConsole("mod: bad size (%d bytes) for %s", filesize, path);
         pd->file->close(f);
         return NULL;
     }
@@ -54,12 +63,15 @@ ModPlayer* mod_player_open(PlaydateAPI* pd, const char* path, int mono)
 
     unsigned char* data = (unsigned char*)pd->system->realloc(NULL, filesize);
     if (!data) {
+        snprintf(mod_last_error, sizeof(mod_last_error),
+                 "Out of memory (%d bytes)", filesize);
         pd->system->logToConsole("mod: malloc failed for file buffer");
         pd->file->close(f);
         return NULL;
     }
 
     if (pd->file->read(f, data, filesize) != filesize) {
+        snprintf(mod_last_error, sizeof(mod_last_error), "Read error");
         pd->system->realloc(data, 0);
         pd->file->close(f);
         return NULL;
@@ -69,6 +81,7 @@ ModPlayer* mod_player_open(PlaydateAPI* pd, const char* path, int mono)
     /* ── Create libxmp context and load module ─────────────────────── */
     xmp_context ctx = xmp_create_context();
     if (!ctx) {
+        snprintf(mod_last_error, sizeof(mod_last_error), "xmp init failed");
         pd->system->logToConsole("mod: xmp_create_context failed");
         pd->system->realloc(data, 0);
         return NULL;
@@ -76,7 +89,18 @@ ModPlayer* mod_player_open(PlaydateAPI* pd, const char* path, int mono)
 
     int err = xmp_load_module_from_memory(ctx, data, (long)filesize);
     if (err != 0) {
-        pd->system->logToConsole("mod: xmp_load_module_from_memory failed (%d)", err);
+        const char* reason = "unknown error";
+        switch (-err) {
+            case 2: reason = "internal error"; break;
+            case 3: reason = "unsupported format"; break;
+            case 4: reason = "load error"; break;
+            case 5: reason = "depack error"; break;
+            case 6: reason = "system error"; break;
+        }
+        snprintf(mod_last_error, sizeof(mod_last_error),
+                 "libxmp: %s (code %d)", reason, err);
+        pd->system->logToConsole("mod: xmp_load_module_from_memory failed (%d: %s)",
+                                 err, reason);
         xmp_free_context(ctx);
         pd->system->realloc(data, 0);
         return NULL;
@@ -87,11 +111,16 @@ ModPlayer* mod_player_open(PlaydateAPI* pd, const char* path, int mono)
 
     /* ── Start the player at Playdate's native sample rate ─────────── */
     if (xmp_start_player(ctx, 44100, mono ? XMP_FORMAT_MONO : 0) != 0) {
+        snprintf(mod_last_error, sizeof(mod_last_error), "xmp start failed");
         pd->system->logToConsole("mod: xmp_start_player failed");
         xmp_release_module(ctx);
         xmp_free_context(ctx);
         return NULL;
     }
+
+    /* ── Performance tuning for Playdate (180 MHz Cortex-M7) ──────── */
+    xmp_set_player(ctx, XMP_PLAYER_INTERP, XMP_INTERP_NEAREST);
+    xmp_set_player(ctx, XMP_PLAYER_DSP, 0);  /* disable lowpass filter */
 
     /* ── Build player struct ───────────────────────────────────────── */
     ModPlayer* mp = (ModPlayer*)pd->system->realloc(NULL, sizeof(ModPlayer));
@@ -171,4 +200,9 @@ void mod_player_seek(ModPlayer* mp, int32_t sample)
 
     /* Reset internal buffer state after seeking */
     xmp_play_buffer(mp->ctx, NULL, 0, 0);
+}
+
+const char* mod_player_last_error(void)
+{
+    return mod_last_error;
 }

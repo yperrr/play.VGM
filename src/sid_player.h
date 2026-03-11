@@ -59,6 +59,15 @@ const char* sid_player_title(SidPlayer* sp);
 /** Null-terminated author from the PSID header (may be empty). */
 const char* sid_player_author(SidPlayer* sp);
 
+/** Returns 1 if ~2 seconds of near-silence detected (subtune ended). */
+int sid_player_is_silent(SidPlayer* sp);
+
+/** Returns total subtune count (1 = no extra subtunes). */
+int sid_player_subtune_count(SidPlayer* sp);
+
+/** Switch to subtune n (1-based, clamped). Returns actual subtune index. */
+int sid_player_set_subtune(SidPlayer* sp, int n);
+
 #ifdef __cplusplus
 }
 #endif
